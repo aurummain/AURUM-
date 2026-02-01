@@ -20,7 +20,7 @@ TON_WALLET = "UQBJNtgVfE-x7-K1uY_EhW1rdvGKhq5gM244fX89VF0bof7R"
 
 COST_PER_TICKET = 10000
 DEFAULT_CONTEST_MINUTES = 10
-TIMER_UPDATE_INTERVAL = 15  # секунд
+TIMER_UPDATE_INTERVAL = 15  # секунд — оптимально
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -224,7 +224,8 @@ async def reject_topup(callback: types.CallbackQuery):
 
     try:
         _, uid_str, amt_str = callback.data.split("_")
-        uid, amt = int(uid_str), int(amt_str)
+        uid = int(uid_str)
+        amt = int(amt_str)
     except:
         await callback.answer("Ошибка", show_alert=True)
         return
@@ -294,7 +295,7 @@ async def admin_start(callback: types.CallbackQuery):
         return
 
     cur.execute("SELECT prize FROM contest WHERE id = 1")
-    row = cur.fetchone()
+    row = cur.fetchone()  # ← один вызов!
     prize = row[0] if row else "Приз не установлен"
 
     end_time = (datetime.utcnow() + timedelta(minutes=DEFAULT_CONTEST_MINUTES)).isoformat()
@@ -406,7 +407,7 @@ async def update_timer():
                 message_id=announce_message_id,
                 reply_markup=await contest_kb()
             )
-            print(f"Таймер обновлён: {m:02d}:{s:02d}")
+            print(f"Таймер обновлён: {m:02d}:{s:02d} | билетов: {total_tickets}")
         except Exception as e:
             print(f"Ошибка редактирования таймера: {e}")
 
@@ -455,10 +456,10 @@ async def keep_alive():
         while True:
             try:
                 async with session.get(url, timeout=10) as resp:
-                    print(f"Keep-alive: {resp.status}")
+                    print(f"Keep-alive ping → {resp.status}")
             except Exception as e:
                 print(f"Keep-alive ошибка: {e}")
-            await asyncio.sleep(240)  # 4 минуты
+            await asyncio.sleep(240)  # каждые 4 минуты
 
 # ──────────────────── FAKE WEB SERVER ────────────────────
 
