@@ -338,6 +338,84 @@ async def stats(callback: types.CallbackQuery):
     await callback.message.answer(text)
     await callback.answer()
 
+@dp.message(Command("send"))
+async def cmd_send(message: types.Message):
+    sender_id = message.from_user.id
+    cur.execute("SELECT tickets FROM users WHERE user_id = ?", (sender_id,))
+    sender_row = cur.fetchone()
+    if not sender_row or sender_row[0] == 0:
+        await message.reply("У вас нет билетов для отправки.")
+        return
+
+    if message.reply_to_message:
+        # Отправка в ответ на сообщение
+        recipient_id = message.reply_to_message.from_user.id
+        if recipient_id == sender_id:
+            await message.reply("Нельзя отправить билеты себе.")
+            return
+        args = message.text.split()[1:]
+        if len(args) != 1 or not args[0].isdigit():
+            await message.reply("Формат: /send <количество> (в ответ на сообщение)")
+            return
+        quantity = int(args[0])
+    else:
+        # Отправка по username
+        args = message.text.split()[1:]
+        if len(args) != 2 or not args[0].startswith('@') or not args[1].isdigit():
+            await message.reply("Формат: /send @username <количество>")
+            return
+        username = args[0][1:]  # убрать @
+        quantity = int(args[1])
+        cur.execute("SELECT user_id FROM users WHERE username = ?", (username,))
+        recipient_row = cur.fetchone()
+        if not recipient_row:
+            await message.reply("Пользователь не найден.")
+            return
+        recipient_id = recipient_row[0]
+        if recipient_id == sender_id:
+            await message.reply("Нельзя отправить билеты себе.")
+            return
+
+    if quantity <= 0:
+        await message.reply("Количество должно быть положительным.")
+        return
+
+    cur.execute("SELECT tickets FROM users WHERE user_id = ?", (sender_id,))
+    sender_tickets = cur.fetchone()[0]
+    if quantity > sender_tickets:
+        await message.reply(f"У вас только {sender_tickets} билетов.")
+        return
+
+    # Обеспечить существование получателя в БД
+    cur.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (recipient_id,))
+
+    # Транзакция
+    cur.execute("UPDATE users SET tickets = tickets - ? WHERE user_id = ?", (quantity, sender_id))
+    cur.execute("UPDATE users SET tickets = tickets + ? WHERE user_id = ?", (quantity, recipient_id))
+    conn.commit()
+
+    # Уведомления
+    sender_username = message.from_user.username or f"ID{sender_id}"
+    recipient_username = (await bot.get_chat(recipient_id)).username or f"ID{recipient_id}"
+
+    await message.reply(f"✅ Отправлено {quantity} билет(ов) пользователю @{recipient_username}")
+    try:
+        await bot.send_message(recipient_id, f"🎟 Получено {quantity} билет(ов) от @{sender_username}")
+    except:
+        pass  # Если нельзя отправить ЛС, игнор
+
+    # Обновить общее количество если нужно
+    if announce_chat_id:
+        cur.execute("SELECT SUM(tickets) FROM users")
+        total = cur.fetchone()[0] or 0
+        try:
+            await bot.send_message(
+                announce_chat_id,
+                f"🔄 Передача: {quantity} билет(ов) от @{sender_username} к @{recipient_username} • Всего: {total}"
+            )
+        except Exception as e:
+            print(f"Ошибка отправки в чат: {e}")
+
 # ──────────────────── АДМИН ФУНКЦИИ ────────────────────
 
 @dp.callback_query(lambda c: c.data == "admin_start")
