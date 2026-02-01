@@ -16,7 +16,9 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 BOT_TOKEN = "import os
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+import os  # ← импортируем модуль ОС
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")  # ← получаем токен из переменной окружения
 ADMIN_ID = 1333099097
 TON_WALLET = "UQBJNtgVfE-x7-K1uY_EhW1rdvGKhq5gM244fX89VF0bof7R"
 
