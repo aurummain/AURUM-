@@ -1,0 +1,560 @@
+import asyncio
+import sqlite3
+from datetime import datetime, timedelta
+
+from aiogram import Bot, Dispatcher, types
+from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+
+# ────────────────────────────────────────────────
+#                   НАСТРОЙКИ
+# ────────────────────────────────────────────────
+
+BOT_TOKEN = "8570594380:AAGDgUcpyZYOSc7xNkcK8KIYrxZGEf0T4Lw"
+ADMIN_ID = 1333099097  # Твой ID — единственный админ
+TON_WALLET = "UQBJNtgVfE-x7-K1uY_EhW1rdvGKhq5gM244fX89VF0bof7R"
+
+COST_PER_TICKET = 10000
+CONTEST_DURATION_MINUTES = 10
+
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+
+# ────────────────────────────────────────────────
+#                   СОСТОЯНИЯ
+# ────────────────────────────────────────────────
+
+class TopUpState(StatesGroup):
+    waiting_amount = State()
+
+class SetPrizeState(StatesGroup):
+    waiting_prize = State()
+
+# ────────────────────────────────────────────────
+#                   БАЗА ДАННЫХ
+# ────────────────────────────────────────────────
+
+conn = sqlite3.connect("lottery.db", check_same_thread=False)
+cur = conn.cursor()
+
+cur.execute("""
+CREATE TABLE IF NOT EXISTS users (
+    user_id           INTEGER PRIMARY KEY,
+    username          TEXT,
+    balance           INTEGER DEFAULT 0,
+    tickets           INTEGER DEFAULT 0,
+    referrer_id       INTEGER,
+    rewarded_referrer INTEGER DEFAULT 0
+)
+""")
+
+cur.execute("""
+CREATE TABLE IF NOT EXISTS contest (
+    id        INTEGER PRIMARY KEY,
+    prize     TEXT,
+    is_active INTEGER DEFAULT 0,
+    end_time  TEXT
+)
+""")
+cur.execute("INSERT OR IGNORE INTO contest (id) VALUES (1)")
+
+cur.execute("""
+CREATE TABLE IF NOT EXISTS allowed_chats (
+    chat_id   INTEGER PRIMARY KEY,
+    title     TEXT,
+    added_at  TEXT DEFAULT CURRENT_TIMESTAMP,
+    added_by  INTEGER
+)
+""")
+conn.commit()
+
+# ────────────────────────────────────────────────
+#                   КЛАВИАТУРЫ
+# ────────────────────────────────────────────────
+
+def user_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💳 Пополнить",     callback_data="topup")],
+        [InlineKeyboardButton(text="🎟 Купить билет",  callback_data="buy")],
+        [InlineKeyboardButton(text="📊 Баланс",        callback_data="balance")],
+        [InlineKeyboardButton(text="🤝 Реф. ссылка",   callback_data="ref")],
+    ])
+
+
+def admin_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="▶️ Запустить конкурс", callback_data="admin_start")],
+        [InlineKeyboardButton(text="⏹ Остановить конкурс", callback_data="admin_stop")],
+        [InlineKeyboardButton(text="🏆 Установить приз",    callback_data="set_prize")],
+        [InlineKeyboardButton(text="👥 Балансы игроков",    callback_data="admin_view_balances")],
+    ])
+
+
+def contest_kb():
+    me = bot.get_me()
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Перейти в личный кабинет", url=f"https://t.me/{me.username}")],
+    ])
+
+
+def confirm_topup_kb(user_id: int, amount: int):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"✅ Подтвердить {amount}", callback_data=f"confirm_{user_id}_{amount}")],
+        [InlineKeyboardButton(text="❌ Отклонить",             callback_data=f"reject_{user_id}")]
+    ])
+
+
+# ────────────────────────────────────────────────
+#                   ПРОВЕРКА — ЯВЛЯЕТСЯ ЛИ БОТ АДМИНОМ
+# ────────────────────────────────────────────────
+
+async def is_bot_admin_in_chat(chat_id: int) -> bool:
+    try:
+        me = await bot.get_me()
+        member = await bot.get_chat_member(chat_id, me.id)
+        return member.status in ("administrator", "creator")
+    except:
+        return False
+
+
+# ────────────────────────────────────────────────
+#               ТАЙМЕР КОНКУРСА (автозавершение)
+# ────────────────────────────────────────────────
+
+async def contest_timer_task(end_time: str):
+    end = datetime.fromisoformat(end_time)
+    wait_seconds = (end - datetime.utcnow()).total_seconds()
+    await asyncio.sleep(max(wait_seconds, 0))
+
+    cur.execute("UPDATE contest SET is_active = 0 WHERE id = 1")
+    conn.commit()
+
+    cur.execute("""
+        SELECT user_id, tickets 
+        FROM users 
+        WHERE tickets > 0 
+        ORDER BY RANDOM() 
+        LIMIT 1
+    """)
+    winner = cur.fetchone()
+
+    cur.execute("SELECT prize FROM contest WHERE id = 1")
+    prize = cur.fetchone()[0] or "не указан"
+
+    winner_text = "Никто не участвовал 😔"
+    winner_id = None
+    if winner:
+        uid, tix = winner
+        winner_text = (
+            f"🏆 <b>Победитель определён!</b>\n"
+            f"Пользователь: <a href='tg://user?id={uid}'>ссылка</a>\n"
+            f"Билетов было: {tix}\n"
+            f"Приз: {prize}"
+        )
+        winner_id = uid
+
+    cur.execute("UPDATE users SET tickets = 0")
+    conn.commit()
+
+    cur.execute("SELECT chat_id FROM allowed_chats")
+    for row in cur.fetchall():
+        chat_id = row[0]
+        try:
+            await bot.send_message(chat_id, winner_text, parse_mode="HTML")
+        except Exception as e:
+            print(f"Ошибка отправки в чат {chat_id}: {e}")
+            await bot.send_message(ADMIN_ID, f"Ошибка отправки в чат {chat_id}: {e}")
+
+    if winner_id:
+        await bot.send_message(winner_id, f"Поздравляем! Вы выиграли приз: {prize}")
+        cur.execute("SELECT username FROM users WHERE user_id = ?", (winner_id,))
+        username = cur.fetchone()[0] or "нет"
+        await bot.send_message(ADMIN_ID, f"Победитель: @{username} (ID {winner_id}) — отправьте приз")
+
+
+# ────────────────────────────────────────────────
+#                   START
+# ────────────────────────────────────────────────
+
+@dp.message(Command("start"))
+async def cmd_start(msg: types.Message):
+    args = msg.text.split()
+    referrer_id = None
+    if len(args) > 1:
+        try:
+            referrer_id = int(args[1])
+        except:
+            pass
+
+    user = msg.from_user
+    cur.execute(
+        "INSERT OR IGNORE INTO users (user_id, username, referrer_id) VALUES (?, ?, ?)",
+        (user.id, user.username, referrer_id)
+    )
+    conn.commit()
+
+    cur.execute("SELECT is_active, prize, end_time FROM contest WHERE id = 1")
+    contest = cur.fetchone()
+    is_active, prize, end_time = contest
+
+    if msg.chat.type == "private":
+        if user.id == ADMIN_ID:
+            await msg.answer("👑 Админ-панель", reply_markup=admin_kb())
+        else:
+            text = f"Добро пожаловать! Ваш баланс: 0 AUR\nБилетов: 0\nШанс победы: 0%"
+            await msg.answer(text, reply_markup=user_kb())
+    else:
+        if is_active:
+            end = datetime.fromisoformat(end_time)
+            remaining = end - datetime.utcnow()
+            minutes, seconds = divmod(remaining.total_seconds(), 60)
+            timer = f"{int(minutes):02d}:{int(seconds):02d}"
+            text = f"Активный конкурс!\nПриз: {prize or 'не указан'}\nОсталось: {timer}"
+            await msg.answer(text, reply_markup=contest_kb())
+        else:
+            await msg.answer("Нет активного конкурса.")
+
+
+# ────────────────────────────────────────────────
+#                   /ADMIN
+# ────────────────────────────────────────────────
+
+@dp.message(Command("admin"))
+async def cmd_admin(msg: types.Message):
+    if msg.from_user.id != ADMIN_ID:
+        return await msg.answer("Доступ запрещён")
+
+    if msg.chat.type != "private":
+        return await msg.answer("Команда /admin работает только в личных сообщениях.")
+
+    await msg.answer("👑 Админ-панель", reply_markup=admin_kb())
+
+
+# ────────────────────────────────────────────────
+#                   ПОПОЛНЕНИЕ
+# ────────────────────────────────────────────────
+
+@dp.callback_query(lambda c: c.data == "topup")
+async def cb_topup(c: types.CallbackQuery, state: FSMContext):
+    if c.message.chat.type != "private":
+        await c.answer("Пополнение только в ЛС бота")
+        return
+
+    await c.message.answer("Введите сумму пополнения в AUR:")
+    await state.set_state(TopUpState.waiting_amount)
+    await c.answer()
+
+
+@dp.message(TopUpState.waiting_amount)
+async def process_topup_amount(msg: types.Message, state: FSMContext):
+    if not msg.text.isdigit():
+        return await msg.answer("Введите число")
+
+    amount = int(msg.text)
+    if amount < 1:
+        return await msg.answer("Сумма должна быть больше 0")
+
+    user = msg.from_user
+    memo = f"{user.id}_{user.username or 'no_username'}"
+
+    text = (
+        f"💳 Пополните <b>{amount}</b> AUR\n"
+        f"Кошелёк: <code>{TON_WALLET}</code>\n"
+        f"Memo: <code>{memo}</code>\n\n"
+        "После перевода нажмите кнопку ниже ↓"
+    )
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Я оплатил", callback_data=f"paid_{amount}")]
+    ])
+
+    await msg.answer(text, parse_mode="HTML", reply_markup=kb)
+
+    try:
+        await bot.send_message(
+            ADMIN_ID,
+            f"🟢 Запрос пополнения\nОт: @{user.username or user.id} ({user.id})\nСумма: {amount} AUR",
+            reply_markup=confirm_topup_kb(user.id, amount)
+        )
+    except Exception as e:
+        print(f"Ошибка отправки админу: {e}")
+
+    await state.clear()
+
+
+@dp.callback_query(lambda c: c.data.startswith("paid_"))
+async def cb_paid(c: types.CallbackQuery):
+    amount = int(c.data.split("_")[1])
+
+    await c.message.delete()
+    await c.message.answer(f"💡 Вы сообщили об оплате {amount} AUR.\nОжидайте подтверждения.")
+    await c.answer()
+
+
+@dp.callback_query(lambda c: c.data.startswith("confirm_"))
+async def cb_confirm(c: types.CallbackQuery):
+    if c.from_user.id != ADMIN_ID:
+        return await c.answer("Доступ запрещён", show_alert=True)
+
+    _, uid_str, amt_str = c.data.split("_")
+    user_id = int(uid_str)
+    amount = int(amt_str)
+
+    cur.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (amount, user_id))
+    conn.commit()
+
+    await bot.send_message(user_id, f"✅ Пополнено {amount} AUR")
+    await c.message.edit_text(f"Подтверждено: {amount} AUR → {user_id}")
+    await c.answer()
+
+
+@dp.callback_query(lambda c: c.data.startswith("reject_"))
+async def cb_reject(c: types.CallbackQuery):
+    if c.from_user.id != ADMIN_ID:
+        return await c.answer("Доступ запрещён", show_alert=True)
+
+    user_id = int(c.data.split("_")[1])
+    await bot.send_message(user_id, "❌ Платёж отклонён.")
+    await c.message.edit_text("Отклонено")
+    await c.answer()
+
+
+# ────────────────────────────────────────────────
+#                   ПОКУПКА БИЛЕТА
+# ────────────────────────────────────────────────
+
+@dp.callback_query(lambda c: c.data == "buy")
+async def cb_buy(c: types.CallbackQuery):
+    user = c.from_user
+
+    if c.message.chat.type != "private":
+        await c.answer("Покупка билетов только в ЛС бота")
+        return
+
+    cur.execute("SELECT balance, tickets, referrer_id, rewarded_referrer FROM users WHERE user_id = ?", (user.id,))
+    row = cur.fetchone()
+    if not row or row[0] < COST_PER_TICKET:
+        await c.message.answer(f"❌ Недостаточно средств (нужно {COST_PER_TICKET} AUR)")
+        return await c.answer()
+
+    balance, tickets_before, ref_id, rewarded = row
+
+    cur.execute(
+        "UPDATE users SET balance = balance - ?, tickets = tickets + 1 WHERE user_id = ?",
+        (COST_PER_TICKET, user.id)
+    )
+    conn.commit()
+
+    cur.execute("SELECT balance, tickets FROM users WHERE user_id = ?", (user.id,))
+    bal, tik = cur.fetchone()
+
+    # Общий шанс победы (процент от общего количества билетов)
+    cur.execute("SELECT SUM(tickets) FROM users")
+    total_tickets = cur.fetchone()[0] or 1
+    win_percentage = (tik / total_tickets) * 100
+
+    await c.message.answer(f"✅ Куплен 1 билет!\nБаланс: {bal} AUR\nБилетов: {tik}\nШанс победы: {win_percentage:.2f}%")
+
+    # Реферальная награда
+    if tickets_before == 0 and ref_id and rewarded == 0:
+        cur.execute("UPDATE users SET tickets = tickets + 1 WHERE user_id = ?", (ref_id,))
+        cur.execute("UPDATE users SET rewarded_referrer = 1 WHERE user_id = ?", (user.id,))
+        conn.commit()
+        await bot.send_message(ref_id, "🎁 +1 билет за реферала, который купил билет!")
+
+    # Анонимное уведомление в группы
+    text = "🎟 Кто-то купил 1 билет!"
+    cur.execute("SELECT chat_id FROM allowed_chats")
+    for row in cur.fetchall():
+        chat_id = row[0]
+        try:
+            await bot.send_message(chat_id, text)
+        except Exception as e:
+            print(f"Ошибка отправки в чат {chat_id}: {e}")
+            await bot.send_message(ADMIN_ID, f"Ошибка отправки в чат {chat_id}: {e}")
+
+    await c.answer()
+
+
+# ────────────────────────────────────────────────
+#                   БАЛАНС
+# ────────────────────────────────────────────────
+
+@dp.callback_query(lambda c: c.data == "balance")
+async def cb_balance(c: types.CallbackQuery):
+    user = c.from_user
+
+    if c.message.chat.type != "private":
+        await c.answer("Баланс только в ЛС бота")
+        return
+
+    cur.execute("SELECT balance, tickets FROM users WHERE user_id = ?", (user.id,))
+    bal, tik = cur.fetchone() or (0, 0)
+
+    cur.execute("SELECT SUM(tickets) FROM users")
+    total_tickets = cur.fetchone()[0] or 1
+    win_percentage = (tik / total_tickets) * 100
+
+    text = f"💰 Баланс: {bal} AUR\n🎟 Билетов: {tik}\nШанс победы: {win_percentage:.2f}%"
+    await c.message.answer(text)
+    await c.answer()
+
+
+# ────────────────────────────────────────────────
+#                   РЕФЕРАЛЬНАЯ ССЫЛКА
+# ────────────────────────────────────────────────
+
+@dp.callback_query(lambda c: c.data == "ref")
+async def cb_ref(c: types.CallbackQuery):
+    user = c.from_user
+    me = await bot.get_me()
+    link = f"https://t.me/{me.username}?start={user.id}"
+    await c.message.answer(f"🤝 Ваша реферальная ссылка:\n{link}")
+    await c.answer()
+
+
+# ────────────────────────────────────────────────
+#                   АДМИН — УПРАВЛЕНИЕ КОНКУРСОМ
+# ────────────────────────────────────────────────
+
+@dp.callback_query(lambda c: c.data == "admin_start")
+async def admin_start(c: types.CallbackQuery):
+    if c.from_user.id != ADMIN_ID:
+        return await c.answer("Доступ запрещён", show_alert=True)
+
+    end = datetime.utcnow() + timedelta(minutes=CONTEST_DURATION_MINUTES)
+    end_iso = end.isoformat()
+
+    cur.execute("UPDATE contest SET is_active = 1, end_time = ? WHERE id = 1", (end_iso,))
+    conn.commit()
+
+    cur.execute("SELECT prize FROM contest WHERE id = 1")
+    prize = cur.fetchone()[0] or "не указан"
+
+    text = (
+        f"🎉 <b>Конкурс запущен!</b>\n"
+        f"🏆 Приз: {prize}\n"
+        f"⏳ Завершится через {CONTEST_DURATION_MINUTES} минут"
+    )
+
+    cur.execute("SELECT chat_id FROM allowed_chats")
+    for row in cur.fetchall():
+        chat_id = row[0]
+        try:
+            await bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=contest_kb())
+        except Exception as e:
+            print(f"Ошибка отправки в чат {chat_id}: {e}")
+            await bot.send_message(ADMIN_ID, f"Ошибка отправки в чат {chat_id}: {e}")
+
+    asyncio.create_task(contest_timer_task(end_iso))
+
+    await c.answer("Конкурс запущен")
+
+
+@dp.callback_query(lambda c: c.data == "admin_stop")
+async def admin_stop(c: types.CallbackQuery):
+    if c.from_user.id != ADMIN_ID:
+        return await c.answer("Доступ запрещён", show_alert=True)
+
+    cur.execute("UPDATE contest SET is_active = 0 WHERE id = 1")
+    conn.commit()
+
+    cur.execute("SELECT user_id, tickets FROM users WHERE tickets > 0 ORDER BY RANDOM() LIMIT 1")
+    winner = cur.fetchone()
+
+    cur.execute("SELECT prize FROM contest WHERE id = 1")
+    prize = cur.fetchone()[0] or "не указан"
+
+    text = "Конкурс остановлен. Никто не участвовал 😔"
+    winner_id = None
+    if winner:
+        uid, tik = winner
+        text = (
+            f"🏆 <b>Победитель!</b>\n"
+            f"<a href='tg://user?id={uid}'>Пользователь</a>\n"
+            f"Билетов: {tik}\n"
+            f"Приз: {prize}"
+        )
+        winner_id = uid
+
+    cur.execute("UPDATE users SET tickets = 0")
+    conn.commit()
+
+    cur.execute("SELECT chat_id FROM allowed_chats")
+    for row in cur.fetchall():
+        chat_id = row[0]
+        try:
+            await bot.send_message(chat_id, text, parse_mode="HTML")
+        except Exception as e:
+            print(f"Ошибка отправки в чат {chat_id}: {e}")
+            await bot.send_message(ADMIN_ID, f"Ошибка отправки в чат {chat_id}: {e}")
+
+    if winner_id:
+        await bot.send_message(winner_id, f"Поздравляем! Вы выиграли приз: {prize}")
+        cur.execute("SELECT username FROM users WHERE user_id = ?", (winner_id,))
+        username = cur.fetchone()[0] or "нет"
+        await bot.send_message(ADMIN_ID, f"Победитель: @{username} (ID {winner_id}) — отправьте приз")
+
+    await c.answer("Конкурс остановлен")
+
+
+@dp.callback_query(lambda c: c.data == "set_prize")
+async def set_prize(c: types.CallbackQuery, state: FSMContext):
+    if c.from_user.id != ADMIN_ID:
+        return await c.answer("Доступ запрещён", show_alert=True)
+
+    await c.message.answer("Введите описание / ссылку на приз:")
+    await state.set_state(SetPrizeState.waiting_prize)
+    await c.answer()
+
+
+@dp.message(SetPrizeState.waiting_prize)
+async def process_prize(msg: types.Message, state: FSMContext):
+    if msg.from_user.id != ADMIN_ID:
+        return
+
+    cur.execute("UPDATE contest SET prize = ? WHERE id = 1", (msg.text,))
+    conn.commit()
+
+    await msg.answer(f"Приз установлен:\n{msg.text}")
+    await state.clear()
+
+
+# ────────────────────────────────────────────────
+#                   АДМИН — БАЛАНСЫ ИГРОКОВ
+# ────────────────────────────────────────────────
+
+@dp.callback_query(lambda c: c.data == "admin_view_balances")
+async def admin_view_balances(c: types.CallbackQuery):
+    if c.from_user.id != ADMIN_ID:
+        return await c.answer("Доступ запрещён", show_alert=True)
+
+    cur.execute("SELECT user_id, username, balance, tickets FROM users ORDER BY balance DESC")
+    rows = cur.fetchall()
+
+    if not rows:
+        await c.message.answer("Никто ещё не зарегистрирован.")
+        return await c.answer()
+
+    text = "Балансы игроков:\n\n"
+    for row in rows:
+        uid, uname, bal, tik = row
+        text += f"ID {uid} (@{uname or 'нет'}): {bal} AUR | {tik} билетов\n"
+
+    await c.message.answer(text)
+    await c.answer()
+
+
+# ────────────────────────────────────────────────
+#                   ЗАПУСК
+# ────────────────────────────────────────────────
+
+async def main():
+    print("Бот запущен. Админ ID:", ADMIN_ID)
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
