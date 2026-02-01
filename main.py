@@ -20,7 +20,7 @@ TON_WALLET = "UQBJNtgVfE-x7-K1uY_EhW1rdvGKhq5gM244fX89VF0bof7R"
 
 COST_PER_TICKET = 10000
 DEFAULT_CONTEST_MINUTES = 10
-TIMER_UPDATE_INTERVAL = 15  # секунд — безопаснее для Telegram
+TIMER_UPDATE_INTERVAL = 15  # секунд
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -122,7 +122,7 @@ async def cmd_start(message: types.Message):
         if user.id == ADMIN_ID:
             await message.answer("👑 Админ-панель", reply_markup=admin_kb())
         else:
-            await message.answer("Добро пожаловать в лотерею!", reply_markup=user_kb())
+            await message.answer("Добро пожаловать!", reply_markup=user_kb())
     else:
         if is_active and end_time:
             try:
@@ -131,11 +131,11 @@ async def cmd_start(message: types.Message):
                     m, s = divmod(int(remaining.total_seconds()), 60)
                     cur.execute("SELECT SUM(tickets) FROM users")
                     total = cur.fetchone()[0] or 0
-                    text = f"🎉 Конкурс идёт!\nПриз: {prize}\nОсталось: {m:02d}:{s:02d}\nБилетов всего: {total}"
+                    text = f"🎉 Активный конкурс!\nПриз: {prize}\nОсталось: {m:02d}:{s:02d}\nБилетов всего: {total}"
                     await message.answer(text, reply_markup=await contest_kb())
                     return
             except Exception as e:
-                print(f"Ошибка в /start групповом: {e}")
+                print(f"Ошибка в групповом /start: {e}")
         await message.answer("Нет активного конкурса.")
 
 @dp.message(Command("addchat"))
@@ -159,12 +159,83 @@ async def cmd_addchat(message: types.Message):
 
     await bot.send_message(ADMIN_ID, f"Чат конкурсов: {message.chat.title or message.chat.id}")
 
-# ──────────────────── ПОКУПКА БИЛЕТА (с сообщением в чат) ────────────────────
+@dp.callback_query(lambda c: c.data == "topup")
+async def cb_topup(callback: types.CallbackQuery, state: FSMContext):
+    if callback.message.chat.type != "private":
+        await callback.answer("Только в ЛС", show_alert=True)
+        return
+    await callback.message.answer("Введите сумму пополнения:")
+    await state.set_state(TopUpState.waiting_amount)
+    await callback.answer()
+
+@dp.message(TopUpState.waiting_amount)
+async def process_topup(message: types.Message, state: FSMContext):
+    if not message.text.isdigit():
+        await message.answer("Введите число")
+        return
+
+    amount = int(message.text)
+    memo = f"{message.from_user.id}_{message.from_user.username or 'no_username'}"
+
+    await message.answer(
+        f"💳 Пополнение на {amount} AUR\n"
+        f"Кошелёк: <code>{TON_WALLET}</code>\n"
+        f"Memo: <code>{memo}</code>",
+        parse_mode="HTML"
+    )
+
+    await bot.send_message(
+        ADMIN_ID,
+        f"🟢 Запрос пополнения\nОт: {message.from_user.id}\nСумма: {amount}",
+        reply_markup=confirm_topup_kb(message.from_user.id, amount)
+    )
+
+    await state.clear()
+
+@dp.callback_query(lambda c: c.data.startswith("confirm_"))
+async def confirm_topup(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("Запрещено", show_alert=True)
+        return
+
+    try:
+        _, uid_str, amt_str = callback.data.split("_")
+        uid, amt = int(uid_str), int(amt_str)
+    except:
+        await callback.answer("Ошибка данных", show_alert=True)
+        return
+
+    cur.execute(
+        "INSERT INTO users (user_id, balance) VALUES (?, ?) "
+        "ON CONFLICT(user_id) DO UPDATE SET balance = balance + ?",
+        (uid, amt, amt)
+    )
+    conn.commit()
+
+    await bot.send_message(uid, f"✅ Баланс пополнен на {amt} AUR")
+    await callback.message.edit_text(callback.message.text + "\n\n✅ Подтверждено")
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data.startswith("reject_"))
+async def reject_topup(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("Запрещено", show_alert=True)
+        return
+
+    try:
+        _, uid_str, amt_str = callback.data.split("_")
+        uid, amt = int(uid_str), int(amt_str)
+    except:
+        await callback.answer("Ошибка", show_alert=True)
+        return
+
+    await bot.send_message(uid, f"❌ Пополнение на {amt} AUR отклонено")
+    await callback.message.edit_text(callback.message.text + "\n\n❌ Отклонено")
+    await callback.answer()
 
 @dp.callback_query(lambda c: c.data == "buy")
 async def buy_ticket(callback: types.CallbackQuery):
     uid = callback.from_user.id
-
     cur.execute("SELECT balance FROM users WHERE user_id = ?", (uid,))
     row = cur.fetchone()
     if not row or row[0] < COST_PER_TICKET:
@@ -177,11 +248,9 @@ async def buy_ticket(callback: types.CallbackQuery):
     )
     conn.commit()
 
-    # Всего билетов
     cur.execute("SELECT SUM(tickets) FROM users")
     total = cur.fetchone()[0] or 0
 
-    # Анонимное сообщение в чат
     if announce_chat_id:
         try:
             await bot.send_message(
@@ -194,11 +263,22 @@ async def buy_ticket(callback: types.CallbackQuery):
     await callback.message.answer("🎟 Билет куплен!")
     await callback.answer()
 
-# ──────────────────── ОСТАЛЬНЫЕ ФУНКЦИИ (сокращённо, оставляем как было) ─────
+@dp.callback_query(lambda c: c.data == "balance")
+async def balance(callback: types.CallbackQuery):
+    cur.execute("SELECT balance, tickets FROM users WHERE user_id = ?", (callback.from_user.id,))
+    bal, tik = cur.fetchone() or (0, 0)
+    await callback.message.answer(f"💰 {bal} AUR\n🎟 {tik}")
+    await callback.answer()
 
-# ... (topup, confirm, reject, balance, ref, set_prize, view_balances, admin_stop — как в предыдущем коде)
+@dp.callback_query(lambda c: c.data == "ref")
+async def ref(callback: types.CallbackQuery):
+    me = await bot.get_me()
+    await callback.message.answer(
+        f"https://t.me/{me.username}?start={callback.from_user.id}"
+    )
+    await callback.answer()
 
-# ──────────────────── ЗАПУСК КОНКУРСА ────────────────────
+# ──────────────────── АДМИН ФУНКЦИИ ────────────────────
 
 @dp.callback_query(lambda c: c.data == "admin_start")
 async def admin_start(callback: types.CallbackQuery):
@@ -214,12 +294,8 @@ async def admin_start(callback: types.CallbackQuery):
         return
 
     cur.execute("SELECT prize FROM contest WHERE id = 1")
-    prize = cur.fetchone()[0] if cur.fetchone() else "Приз не установлен"
-
-    if not prize:
-        await callback.message.answer("Установите приз сначала")
-        await callback.answer()
-        return
+    row = cur.fetchone()
+    prize = row[0] if row else "Приз не установлен"
 
     end_time = (datetime.utcnow() + timedelta(minutes=DEFAULT_CONTEST_MINUTES)).isoformat()
 
@@ -237,9 +313,65 @@ async def admin_start(callback: types.CallbackQuery):
     timer_task = asyncio.create_task(update_timer())
 
     await callback.message.answer("Конкурс запущен!")
+    await callback.answer("Запущен")
+
+@dp.callback_query(lambda c: c.data == "admin_stop")
+async def admin_stop(callback: types.CallbackQuery):
+    global timer_task
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    cur.execute("UPDATE contest SET is_active = 0, end_time = NULL WHERE id = 1")
+    conn.commit()
+
+    if timer_task:
+        timer_task.cancel()
+
+    if announce_chat_id and announce_message_id:
+        await bot.edit_message_text(
+            "⏹ Конкурс остановлен",
+            chat_id=announce_chat_id,
+            message_id=announce_message_id
+        )
+
+    await callback.message.answer("Конкурс остановлен")
     await callback.answer()
 
-# ──────────────────── ТАЙМЕР + АВТОРОЗЫГРЫШ ────────────────────
+@dp.callback_query(lambda c: c.data == "set_prize")
+async def admin_set_prize(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    await callback.message.answer("Введите текст приза:")
+    await state.set_state(SetPrizeState.waiting_prize)
+    await callback.answer()
+
+@dp.message(SetPrizeState.waiting_prize)
+async def process_prize(message: types.Message, state: FSMContext):
+    prize = message.text.strip()
+    cur.execute("UPDATE contest SET prize = ? WHERE id = 1", (prize,))
+    conn.commit()
+    await message.answer(f"Приз установлен: {prize}")
+    await state.clear()
+
+@dp.callback_query(lambda c: c.data == "admin_view_balances")
+async def admin_view_balances(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    cur.execute("SELECT user_id, username, balance, tickets FROM users")
+    rows = cur.fetchall()
+    if not rows:
+        await callback.message.answer("Нет игроков")
+    else:
+        text = "Балансы:\n" + "\n".join([f"@{r[1] or r[0]}: {r[2]} AUR, {r[3]} билетов" for r in rows])
+        await callback.message.answer(text)
+    await callback.answer()
+
+# ──────────────────── ТАЙМЕР + РОЗЫГРЫШ ────────────────────
 
 async def update_timer():
     global announce_chat_id, announce_message_id
@@ -249,7 +381,8 @@ async def update_timer():
 
         cur.execute("SELECT is_active, end_time, prize FROM contest WHERE id = 1")
         row = cur.fetchone()
-        if not row or not row[0] or not row[1]:
+        if not row or row[0] == 0 or not row[1]:
+            print("Таймер остановлен: конкурс не активен")
             break
 
         end_time = datetime.fromisoformat(row[1])
@@ -259,6 +392,7 @@ async def update_timer():
         total_tickets = cur.fetchone()[0] or 0
 
         if remaining.total_seconds() <= 0:
+            print("Таймер завершён → запуск розыгрыша")
             await perform_draw(total_tickets)
             break
 
@@ -272,8 +406,9 @@ async def update_timer():
                 message_id=announce_message_id,
                 reply_markup=await contest_kb()
             )
+            print(f"Таймер обновлён: {m:02d}:{s:02d}")
         except Exception as e:
-            print(f"Timer edit error: {e}")
+            print(f"Ошибка редактирования таймера: {e}")
 
 async def perform_draw(total_tickets):
     if total_tickets == 0:
@@ -289,12 +424,12 @@ async def perform_draw(total_tickets):
         winner_id = random.choice(pool)
 
         cur.execute("SELECT username FROM users WHERE user_id = ?", (winner_id,))
-        winner = cur.fetchone()[0] or f"ID {winner_id}"
+        winner_username = cur.fetchone()[0] or f"ID{winner_id}"
 
-        text = f"🎉 Конкурс завершён!\nПобедитель: @{winner}\nПоздравляем! Напишите админу за призом."
+        text = f"🎉 Конкурс завершён!\nПобедитель: @{winner_username}\nПоздравляем!"
 
-        await bot.send_message(winner_id, "Вы выиграли! Напишите админу.")
-        await bot.send_message(ADMIN_ID, f"Победитель: @{winner} (ID {winner_id})")
+        await bot.send_message(winner_id, "🎉 Вы выиграли! Напишите админу за призом.")
+        await bot.send_message(ADMIN_ID, f"Победитель: @{winner_username} (ID {winner_id})")
 
     await bot.edit_message_text(
         text,
@@ -302,31 +437,30 @@ async def perform_draw(total_tickets):
         message_id=announce_message_id
     )
 
-    # Сброс
     cur.execute("UPDATE contest SET is_active = 0, end_time = NULL WHERE id = 1")
     cur.execute("UPDATE users SET tickets = 0")
     conn.commit()
+    print("Розыгрыш завершён, билеты сброшены")
 
-# ──────────────────── SELF-PING ДЛЯ ПРОДЛЕНИЯ ЖИЗНИ НА RENDER ────────────────────
+# ──────────────────── KEEP-ALIVE (self-ping) ────────────────────
 
-async def self_ping():
-    my_url = os.environ.get("RENDER_EXTERNAL_HOSTNAME")
-    if not my_url:
-        print("RENDER_EXTERNAL_HOSTNAME не найден — self-ping отключён")
+async def keep_alive():
+    my_host = os.environ.get("RENDER_EXTERNAL_HOSTNAME")
+    if not my_host:
+        print("Нет RENDER_EXTERNAL_HOSTNAME → keep-alive отключён")
         return
 
-    url = f"https://{my_url}/health"
-
+    url = f"https://{my_host}/health"
     async with aiohttp.ClientSession() as session:
         while True:
             try:
-                async with session.get(url) as resp:
-                    print(f"Self-ping: {resp.status}")
+                async with session.get(url, timeout=10) as resp:
+                    print(f"Keep-alive: {resp.status}")
             except Exception as e:
-                print(f"Self-ping ошибка: {e}")
-            await asyncio.sleep(300)  # каждые 5 минут
+                print(f"Keep-alive ошибка: {e}")
+            await asyncio.sleep(240)  # 4 минуты
 
-# ──────────────────── FAKE WEB SERVER (улучшенный) ────────────────────
+# ──────────────────── FAKE WEB SERVER ────────────────────
 
 async def fake_web_server():
     async def handle(request):
@@ -334,7 +468,7 @@ async def fake_web_server():
 
     app = web.Application()
     app.router.add_get("/", handle)
-    app.router.add_get("/health", handle)  # именно этот маршрут пингует Render
+    app.router.add_get("/health", handle)
 
     runner = web.AppRunner(app)
     await runner.setup()
@@ -342,15 +476,15 @@ async def fake_web_server():
     port = int(os.environ.get("PORT", 10000))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    print(f"Сервер на порту {port}")
+    print(f"Сервер запущен на порту {port}")
 
 # ──────────────────── ЗАПУСК ────────────────────
 
 async def main():
-    print("Бот стартует...")
+    print("Бот запущен")
     await asyncio.gather(
         fake_web_server(),
-        self_ping(),               # анти-idle
+        keep_alive(),
         dp.start_polling(
             bot,
             allowed_updates=["message", "callback_query"],
