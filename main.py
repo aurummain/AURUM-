@@ -1,7 +1,7 @@
 import asyncio
 import os
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import datetime
 
 from aiohttp import web
 from aiogram import Bot, Dispatcher, types
@@ -54,7 +54,7 @@ CREATE TABLE IF NOT EXISTS contest (
     end_time TEXT
 )
 """)
-cur.execute("INSERT OR IGNORE INTO contest (id) VALUES (1)")
+cur.execute("INSERT OR IGNORE INTO contest (id, is_active) VALUES (1, 0)")
 
 cur.execute("""
 CREATE TABLE IF NOT EXISTS allowed_chats (
@@ -62,7 +62,7 @@ CREATE TABLE IF NOT EXISTS allowed_chats (
     title TEXT,
     added_at TEXT DEFAULT CURRENT_TIMESTAMP,
     added_by INTEGER,
-    message_id INTEGER DEFAULT NULL
+    message_id INTEGER
 )
 """)
 conn.commit()
@@ -103,122 +103,187 @@ def confirm_topup_kb(user_id: int, amount: int):
 # ──────────────────── HANDLERS ────────────────────
 
 @dp.message(Command("start"))
-async def cmd_start(msg: types.Message):
-    args = msg.text.split()
+async def cmd_start(message: types.Message):
+    args = message.text.split()
     referrer_id = int(args[1]) if len(args) > 1 and args[1].isdigit() else None
 
-    user = msg.from_user
+    user = message.from_user
     cur.execute(
-        "INSERT OR IGNORE INTO users (user_id, username, referrer_id) VALUES (?, ?, ?)",
+        """
+        INSERT OR IGNORE INTO users (user_id, username, referrer_id)
+        VALUES (?, ?, ?)
+        """,
         (user.id, user.username, referrer_id)
     )
     conn.commit()
 
     cur.execute("SELECT is_active, prize, end_time FROM contest WHERE id = 1")
-    contest = cur.fetchone()
-    is_active, prize, end_time = contest if contest else (0, None, None)
+    row = cur.fetchone()
+    is_active, prize, end_time = row if row else (0, None, None)
 
-    if msg.chat.type == "private":
+    if message.chat.type == "private":
         if user.id == ADMIN_ID:
-            await msg.answer("👑 Админ-панель", reply_markup=admin_kb())
+            await message.answer("👑 Админ-панель", reply_markup=admin_kb())
         else:
-            await msg.answer("Добро пожаловать!", reply_markup=user_kb())
+            await message.answer("Добро пожаловать!", reply_markup=user_kb())
     else:
-        if is_active:
-            remaining = datetime.fromisoformat(end_time) - datetime.utcnow()
-            if remaining.total_seconds() > 0:
-                m, s = divmod(int(remaining.total_seconds()), 60)
-                await msg.answer(
-                    f"🎉 Активный конкурс!\n🏆 Приз: {prize}\n⏳ Осталось: {m:02d}:{s:02d}",
-                    reply_markup=await contest_kb()
-                )
-                return
-        await msg.answer("Нет активного конкурса.")
+        if is_active and end_time:
+            try:
+                remaining = datetime.fromisoformat(end_time) - datetime.utcnow()
+                if remaining.total_seconds() > 0:
+                    m, s = divmod(int(remaining.total_seconds()), 60)
+                    await message.answer(
+                        f"🎉 Активный конкурс!\n🏆 Приз: {prize}\n⏳ Осталось: {m:02d}:{s:02d}",
+                        reply_markup=await contest_kb()
+                    )
+                    return
+            except:
+                pass
+        await message.answer("Нет активного конкурса.")
+
+# ── Callbacks ────────────────────────────────────────
 
 @dp.callback_query(lambda c: c.data == "topup")
-async def cb_topup(c: types.CallbackQuery, state: FSMContext):
-    if c.message.chat.type != "private":
-        return await c.answer("Только в ЛС")
-    await c.message.answer("Введите сумму пополнения:")
+async def cb_topup(callback: types.CallbackQuery, state: FSMContext):
+    if callback.message.chat.type != "private":
+        await callback.answer("Только в личке", show_alert=True)
+        return
+    await callback.message.answer("Введите сумму пополнения (число):")
     await state.set_state(TopUpState.waiting_amount)
-    await c.answer()
+    await callback.answer()
+
 
 @dp.message(TopUpState.waiting_amount)
-async def process_topup(msg: types.Message, state: FSMContext):
-    if not msg.text.isdigit():
-        return await msg.answer("Введите число")
+async def process_topup_amount(message: types.Message, state: FSMContext):
+    if not message.text.isdigit():
+        await message.answer("Нужно ввести число")
+        return
 
-    amount = int(msg.text)
-    memo = f"{msg.from_user.id}_{msg.from_user.username or 'no_username'}"
+    amount = int(message.text)
+    if amount <= 0:
+        await message.answer("Сумма должна быть больше 0")
+        return
 
-    await msg.answer(
+    memo = f"{message.from_user.id}_{message.from_user.username or 'no_username'}"
+
+    await message.answer(
         f"💳 Пополнение на {amount} AUR\n"
         f"Кошелёк: <code>{TON_WALLET}</code>\n"
-        f"Memo: <code>{memo}</code>",
+        f"Memo: <code>{memo}</code>\n\n"
+        f"После оплаты напишите админу или дождитесь подтверждения.",
         parse_mode="HTML"
     )
 
     await bot.send_message(
         ADMIN_ID,
-        f"🟢 Запрос пополнения\nОт: {msg.from_user.id}\nСумма: {amount}",
-        reply_markup=confirm_topup_kb(msg.from_user.id, amount)
+        f"🟢 Запрос пополнения\n"
+        f"От: {message.from_user.id} (@{message.from_user.username or 'нет'})\n"
+        f"Сумма: {amount} AUR",
+        reply_markup=confirm_topup_kb(message.from_user.id, amount)
     )
 
     await state.clear()
 
-@dp.callback_query(lambda c: c.data.startswith("confirm_"))
-async def confirm_topup(c: types.CallbackQuery):
-    if c.from_user.id != ADMIN_ID:
-        return await c.answer("Запрещено", show_alert=True)
 
-    _, uid, amt = c.data.split("_")
+@dp.callback_query(lambda c: c.data.startswith("confirm_"))
+async def confirm_topup(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("Доступ запрещён", show_alert=True)
+        return
+
+    try:
+        _, uid_str, amt_str = callback.data.split("_")
+        uid = int(uid_str)
+        amt = int(amt_str)
+    except:
+        await callback.answer("Ошибка в данных", show_alert=True)
+        return
+
     cur.execute(
-        "INSERT INTO users (user_id, balance) VALUES (?, ?) "
-        "ON CONFLICT(user_id) DO UPDATE SET balance = balance + ?",
-        (int(uid), int(amt), int(amt))
+        """
+        INSERT INTO users (user_id, balance)
+        VALUES (?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET balance = balance + ?
+        """,
+        (uid, amt, amt)
     )
     conn.commit()
 
-    await bot.send_message(int(uid), f"✅ Баланс пополнен на {amt} AUR")
-    await c.message.edit_text("Подтверждено")
-    await c.answer()
+    await bot.send_message(uid, f"✅ Баланс пополнен на {amt} AUR")
+    await callback.message.edit_text(callback.message.text + "\n\n✅ Подтверждено")
+    await callback.answer("Пополнение подтверждено")
+
 
 @dp.callback_query(lambda c: c.data == "buy")
-async def buy_ticket(c: types.CallbackQuery):
-    cur.execute("SELECT balance FROM users WHERE user_id = ?", (c.from_user.id,))
+async def buy_ticket(callback: types.CallbackQuery):
+    cur.execute("SELECT balance FROM users WHERE user_id = ?", (callback.from_user.id,))
     row = cur.fetchone()
+
     if not row or row[0] < COST_PER_TICKET:
-        return await c.message.answer("❌ Недостаточно средств")
+        await callback.message.answer("❌ Недостаточно средств на балансе")
+        await callback.answer()
+        return
 
     cur.execute(
-        "UPDATE users SET balance = balance - ?, tickets = tickets + 1 WHERE user_id = ?",
-        (COST_PER_TICKET, c.from_user.id)
+        """
+        UPDATE users
+        SET balance = balance - ?,
+            tickets = tickets + 1
+        WHERE user_id = ?
+        """,
+        (COST_PER_TICKET, callback.from_user.id)
     )
     conn.commit()
 
-    await c.message.answer("🎟 Билет куплен!")
-    await c.answer()
+    await callback.message.answer("🎟 Билет успешно куплен!")
+    await callback.answer()
+
 
 @dp.callback_query(lambda c: c.data == "balance")
-async def balance(c: types.CallbackQuery):
-    cur.execute("SELECT balance, tickets FROM users WHERE user_id = ?", (c.from_user.id,))
-    bal, tik = cur.fetchone() or (0, 0)
-    await c.message.answer(f"💰 {bal} AUR\n🎟 {tik}")
-    await c.answer()
+async def show_balance(callback: types.CallbackQuery):
+    cur.execute(
+        "SELECT balance, tickets FROM users WHERE user_id = ?",
+        (callback.from_user.id,)
+    )
+    row = cur.fetchone()
+    bal, tik = row if row else (0, 0)
+
+    await callback.message.answer(f"💰 Баланс: {bal} AUR\n🎟 Билетов: {tik}")
+    await callback.answer()
+
 
 @dp.callback_query(lambda c: c.data == "ref")
-async def ref(c: types.CallbackQuery):
+async def referral_link(callback: types.CallbackQuery):
     me = await bot.get_me()
-    await c.message.answer(
-        f"https://t.me/{me.username}?start={c.from_user.id}"
-    )
-    await c.answer()
+    link = f"https://t.me/{me.username}?start={callback.from_user.id}"
+    await callback.message.answer(f"Ваша реферальная ссылка:\n{link}")
+    await callback.answer()
 
-# ──────────────────── FAKE WEB SERVER (Костыль) ────────────────────
+
+@dp.callback_query(lambda c: c.data in ("admin_start", "admin_stop", "set_prize", "admin_view_balances"))
+async def admin_buttons(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("Только для администратора", show_alert=True)
+        return
+
+    data = callback.data
+
+    if data == "admin_start":
+        await callback.message.answer("Логика запуска конкурса пока не реализована")
+    elif data == "admin_stop":
+        await callback.message.answer("Логика остановки конкурса пока не реализована")
+    elif data == "set_prize":
+        await callback.message.answer("Логика установки приза пока не реализована")
+    elif data == "admin_view_balances":
+        await callback.message.answer("Логика просмотра балансов пока не реализована")
+
+    await callback.answer()
+
+# ──────────────────── FAKE WEB SERVER (для Render / Railway и т.п.) ───────
 
 async def fake_web_server():
     async def handle(request):
-        return web.Response(text="OK")
+        return web.Response(text="Bot is alive")
 
     app = web.Application()
     app.router.add_get("/", handle)
@@ -229,16 +294,16 @@ async def fake_web_server():
     port = int(os.environ.get("PORT", 10000))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
+    print(f"Fake web server running on port {port}")
 
-    print(f"Fake web server started on port {port}")
 
 # ──────────────────── ЗАПУСК ────────────────────
 
 async def main():
-    print("Бот запущен")
+    print("Бот запускается...")
     await asyncio.gather(
-        fake_web_server(),       # 👈 костыль для Render
-        dp.start_polling(bot),   # 👈 бот
+        fake_web_server(),
+        dp.start_polling(bot, allowed_updates=types.AllowedUpdates.MESSAGE + types.AllowedUpdates.CALLBACK_QUERY)
     )
 
 if __name__ == "__main__":
