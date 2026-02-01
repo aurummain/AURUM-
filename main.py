@@ -19,7 +19,7 @@ CONTEST_DURATION_MINUTES = 10
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# Состояния FSM
+# Состояния
 class TopUpState(StatesGroup):
     waiting_amount = State()
 
@@ -32,31 +32,31 @@ cur = conn.cursor()
 
 cur.execute("""
 CREATE TABLE IF NOT EXISTS users (
-    user_id           INTEGER PRIMARY KEY,
-    username          TEXT,
-    balance           INTEGER DEFAULT 0,
-    tickets           INTEGER DEFAULT 0,
-    referrer_id       INTEGER,
+    user_id INTEGER PRIMARY KEY,
+    username TEXT,
+    balance INTEGER DEFAULT 0,
+    tickets INTEGER DEFAULT 0,
+    referrer_id INTEGER,
     rewarded_referrer INTEGER DEFAULT 0
 )
 """)
 
 cur.execute("""
 CREATE TABLE IF NOT EXISTS contest (
-    id        INTEGER PRIMARY KEY,
-    prize     TEXT,
+    id INTEGER PRIMARY KEY,
+    prize TEXT,
     is_active INTEGER DEFAULT 0,
-    end_time  TEXT
+    end_time TEXT
 )
 """)
 cur.execute("INSERT OR IGNORE INTO contest (id) VALUES (1)")
 
 cur.execute("""
 CREATE TABLE IF NOT EXISTS allowed_chats (
-    chat_id    INTEGER PRIMARY KEY,
-    title      TEXT,
-    added_at   TEXT DEFAULT CURRENT_TIMESTAMP,
-    added_by   INTEGER,
+    chat_id INTEGER PRIMARY KEY,
+    title TEXT,
+    added_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    added_by INTEGER,
     message_id INTEGER DEFAULT NULL
 )
 """)
@@ -65,10 +65,10 @@ conn.commit()
 # Клавиатуры
 def user_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💳 Пополнить",     callback_data="topup")],
-        [InlineKeyboardButton(text="🎟 Купить билет",  callback_data="buy")],
-        [InlineKeyboardButton(text="📊 Баланс",        callback_data="balance")],
-        [InlineKeyboardButton(text="🤝 Реф. ссылка",   callback_data="ref")],
+        [InlineKeyboardButton(text="💳 Пополнить", callback_data="topup")],
+        [InlineKeyboardButton(text="🎟 Купить билет", callback_data="buy")],
+        [InlineKeyboardButton(text="📊 Баланс", callback_data="balance")],
+        [InlineKeyboardButton(text="🤝 Реф. ссылка", callback_data="ref")],
     ])
 
 
@@ -76,8 +76,8 @@ def admin_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="▶️ Запустить конкурс", callback_data="admin_start")],
         [InlineKeyboardButton(text="⏹ Остановить конкурс", callback_data="admin_stop")],
-        [InlineKeyboardButton(text="🏆 Установить приз",    callback_data="set_prize")],
-        [InlineKeyboardButton(text="👥 Балансы игроков",    callback_data="admin_view_balances")],
+        [InlineKeyboardButton(text="🏆 Установить приз", callback_data="set_prize")],
+        [InlineKeyboardButton(text="👥 Балансы игроков", callback_data="admin_view_balances")],
     ])
 
 
@@ -91,7 +91,7 @@ async def contest_kb():
 def confirm_topup_kb(user_id: int, amount: int):
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=f"✅ Подтвердить {amount}", callback_data=f"confirm_{user_id}_{amount}")],
-        [InlineKeyboardButton(text="❌ Отклонить",             callback_data=f"reject_{user_id}")]
+        [InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_{user_id}")]
     ])
 
 
@@ -149,25 +149,6 @@ async def cmd_admin(msg: types.Message):
     await msg.answer("👑 Админ-панель", reply_markup=admin_kb())
 
 
-# Добавление чата в рассылку
-@dp.message(Command("addchat"))
-async def cmd_addchat(msg: types.Message):
-    if msg.from_user.id != ADMIN_ID:
-        return await msg.answer("Только админ может добавлять чаты")
-
-    if msg.chat.type in ("group", "supergroup"):
-        chat_id = msg.chat.id
-        title = msg.chat.title or "Без названия"
-        cur.execute(
-            "INSERT OR IGNORE INTO allowed_chats (chat_id, title) VALUES (?, ?)",
-            (chat_id, title)
-        )
-        conn.commit()
-        await msg.answer(f"Группа {title} добавлена в рассылку конкурсов!")
-    else:
-        await msg.answer("Команда /addchat работает только в группах")
-
-
 # Пополнение
 @dp.callback_query(lambda c: c.data == "topup")
 async def cb_topup(c: types.CallbackQuery, state: FSMContext):
@@ -216,16 +197,7 @@ async def process_topup_amount(msg: types.Message, state: FSMContext):
     await state.clear()
 
 
-# Подтверждение/отклонение
-@dp.callback_query(lambda c: c.data.startswith("paid_"))
-async def cb_paid(c: types.CallbackQuery):
-    amount = int(c.data.split("_")[1])
-
-    await c.message.delete()
-    await c.message.answer(f"💡 Сообщили об оплате {amount} AUR.\nОжидайте подтверждения.")
-    await c.answer()
-
-
+# Подтверждение пополнения (с исправлением)
 @dp.callback_query(lambda c: c.data.startswith("confirm_"))
 async def cb_confirm(c: types.CallbackQuery):
     if c.from_user.id != ADMIN_ID:
@@ -235,7 +207,16 @@ async def cb_confirm(c: types.CallbackQuery):
     user_id = int(uid_str)
     amount = int(amt_str)
 
-    cur.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (amount, user_id))
+    # Проверка на существование пользователя
+    cur.execute("SELECT balance FROM users WHERE user_id = ?", (user_id,))
+    row = cur.fetchone()
+    if not row:
+        # Если нет — создаём с балансом amount
+        cur.execute("INSERT INTO users (user_id, balance) VALUES (?, ?)", (user_id, amount))
+    else:
+        # Если есть — обновляем
+        cur.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (amount, user_id))
+
     conn.commit()
 
     await bot.send_message(user_id, f"✅ Пополнено {amount} AUR")
@@ -243,6 +224,7 @@ async def cb_confirm(c: types.CallbackQuery):
     await c.answer()
 
 
+# Отклонение
 @dp.callback_query(lambda c: c.data.startswith("reject_"))
 async def cb_reject(c: types.CallbackQuery):
     if c.from_user.id != ADMIN_ID:
@@ -302,7 +284,7 @@ async def cb_balance(c: types.CallbackQuery):
     await c.answer()
 
 
-# Реферальная ссылка
+# Реф. ссылка
 @dp.callback_query(lambda c: c.data == "ref")
 async def cb_ref(c: types.CallbackQuery):
     if c.message.chat.type != "private":
@@ -315,124 +297,9 @@ async def cb_ref(c: types.CallbackQuery):
     await c.answer()
 
 
-# Запуск конкурса (только в ЛС админа)
-@dp.callback_query(lambda c: c.data == "admin_start")
-async def admin_start(c: types.CallbackQuery):
-    if c.from_user.id != ADMIN_ID:
-        return await c.answer("Доступ запрещён", show_alert=True)
-
-    if c.message.chat.type != "private":
-        return await c.answer("Запуск конкурса только в личных сообщениях!", show_alert=True)
-
-    end = datetime.utcnow() + timedelta(minutes=CONTEST_DURATION_MINUTES)
-    end_iso = end.isoformat()
-
-    cur.execute("UPDATE contest SET is_active = 1, end_time = ? WHERE id = 1", (end_iso,))
-    conn.commit()
-
-    cur.execute("SELECT prize FROM contest WHERE id = 1")
-    prize = cur.fetchone()[0] or "не указан"
-
-    await c.answer("Конкурс запущен! Рассылка в группы выполнена.")
-
-
-# Остановка конкурса
-@dp.callback_query(lambda c: c.data == "admin_stop")
-async def admin_stop(c: types.CallbackQuery):
-    if c.from_user.id != ADMIN_ID:
-        return await c.answer("Доступ запрещён", show_alert=True)
-
-    cur.execute("UPDATE contest SET is_active = 0 WHERE id = 1")
-    conn.commit()
-
-    cur.execute("SELECT user_id, tickets FROM users WHERE tickets > 0 ORDER BY RANDOM() LIMIT 1")
-    winner = cur.fetchone()
-
-    text = "Конкурс остановлен. Никто не участвовал 😔"
-    if winner:
-        uid, tik = winner
-        text = f"Победитель: ID {uid}\nБилетов: {tik}"
-
-    cur.execute("UPDATE users SET tickets = 0")
-    conn.commit()
-
-    cur.execute("SELECT chat_id FROM allowed_chats")
-    for row in cur.fetchall():
-        try:
-            await bot.send_message(row[0], text)
-        except Exception as e:
-            print(f"Ошибка отправки в чат {row[0]}: {e}")
-
-    await c.answer("Конкурс остановлен")
-
-
-# Таймер и рассылка в группы
-async def contest_timer_task():
-    while True:
-        cur.execute("SELECT is_active, end_time, prize FROM contest WHERE id = 1")
-        row = cur.fetchone()
-        if not row or not row[0]:
-            await asyncio.sleep(30)
-            continue
-
-        is_active, end_time, prize = row
-        end = datetime.fromisoformat(end_time)
-        remaining = end - datetime.utcnow()
-
-        if remaining.total_seconds() <= 0:
-            # Завершение конкурса
-            cur.execute("UPDATE contest SET is_active = 0 WHERE id = 1")
-            conn.commit()
-
-            cur.execute("SELECT user_id, tickets FROM users WHERE tickets > 0 ORDER BY RANDOM() LIMIT 1")
-            winner = cur.fetchone()
-
-            text = "Конкурс завершён. Никто не участвовал 😔"
-            winner_id = None
-            if winner:
-                uid, tik = winner
-                text = f"🏆 Победитель: ID {uid} (билетов: {tik})\nПриз: {prize or 'не указан'}"
-                winner_id = uid
-
-            cur.execute("UPDATE users SET tickets = 0")
-            conn.commit()
-
-            cur.execute("SELECT chat_id FROM allowed_chats")
-            for row in cur.fetchall():
-                try:
-                    await bot.send_message(row[0], text)
-                except Exception as e:
-                    print(f"Ошибка отправки в чат {row[0]}: {e}")
-
-            if winner_id:
-                await bot.send_message(winner_id, f"Поздравляем! Вы выиграли: {prize}")
-                cur.execute("SELECT username FROM users WHERE user_id = ?", (winner_id,))
-                username = cur.fetchone()[0] or "нет"
-                await bot.send_message(ADMIN_ID, f"Победитель: @{username} (ID {winner_id}) — отправьте приз")
-
-            await asyncio.sleep(30)
-            continue
-
-        # Обновление таймера в группах
-        minutes, seconds = divmod(int(remaining.total_seconds()), 60)
-        timer = f"{minutes:02d}:{seconds:02d}"
-        text = f"Активный конкурс!\nПриз: {prize or 'не указан'}\nОсталось: {timer}"
-
-        cur.execute("SELECT chat_id FROM allowed_chats")
-        for row in cur.fetchall():
-            chat_id = row[0]
-            try:
-                await bot.send_message(chat_id, text, reply_markup=await contest_kb())
-            except Exception as e:
-                print(f"Ошибка обновления в чат {chat_id}: {e}")
-
-        await asyncio.sleep(10)
-
-
 # Запуск
 async def main():
     print("Бот запущен. Админ ID:", ADMIN_ID)
-    asyncio.create_task(contest_timer_task())
     await dp.start_polling(bot)
 
 
