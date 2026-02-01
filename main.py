@@ -27,9 +27,6 @@ dp = Dispatcher()
 class TopUpState(StatesGroup):
     waiting_amount = State()
 
-class SetPrizeState(StatesGroup):
-    waiting_prize = State()
-
 # ──────────────────── БАЗА ДАННЫХ ────────────────────
 
 conn = sqlite3.connect("lottery.db", check_same_thread=False)
@@ -109,10 +106,7 @@ async def cmd_start(message: types.Message):
 
     user = message.from_user
     cur.execute(
-        """
-        INSERT OR IGNORE INTO users (user_id, username, referrer_id)
-        VALUES (?, ?, ?)
-        """,
+        "INSERT OR IGNORE INTO users (user_id, username, referrer_id) VALUES (?, ?, ?)",
         (user.id, user.username, referrer_id)
     )
     conn.commit()
@@ -121,7 +115,7 @@ async def cmd_start(message: types.Message):
     row = cur.fetchone()
     is_active, prize, end_time = row if row else (0, None, None)
 
-    if message.chat.type == "private":
+    if message.chat.type == types.ChatType.PRIVATE:
         if user.id == ADMIN_ID:
             await message.answer("👑 Админ-панель", reply_markup=admin_kb())
         else:
@@ -132,20 +126,17 @@ async def cmd_start(message: types.Message):
                 remaining = datetime.fromisoformat(end_time) - datetime.utcnow()
                 if remaining.total_seconds() > 0:
                     m, s = divmod(int(remaining.total_seconds()), 60)
-                    await message.answer(
-                        f"🎉 Активный конкурс!\n🏆 Приз: {prize}\n⏳ Осталось: {m:02d}:{s:02d}",
-                        reply_markup=await contest_kb()
-                    )
+                    text = f"🎉 Активный конкурс!\n🏆 Приз: {prize}\n⏳ Осталось: {m:02d}:{s:02d}"
+                    await message.answer(text, reply_markup=await contest_kb())
                     return
-            except:
+            except Exception:
                 pass
         await message.answer("Нет активного конкурса.")
 
-# ── Callbacks ────────────────────────────────────────
 
 @dp.callback_query(lambda c: c.data == "topup")
 async def cb_topup(callback: types.CallbackQuery, state: FSMContext):
-    if callback.message.chat.type != "private":
+    if callback.message.chat.type != types.ChatType.PRIVATE:
         await callback.answer("Только в личке", show_alert=True)
         return
     await callback.message.answer("Введите сумму пополнения (число):")
@@ -156,7 +147,7 @@ async def cb_topup(callback: types.CallbackQuery, state: FSMContext):
 @dp.message(TopUpState.waiting_amount)
 async def process_topup_amount(message: types.Message, state: FSMContext):
     if not message.text.isdigit():
-        await message.answer("Нужно ввести число")
+        await message.answer("Нужно ввести положительное число")
         return
 
     amount = int(message.text)
@@ -166,13 +157,14 @@ async def process_topup_amount(message: types.Message, state: FSMContext):
 
     memo = f"{message.from_user.id}_{message.from_user.username or 'no_username'}"
 
-    await message.answer(
+    text = (
         f"💳 Пополнение на {amount} AUR\n"
         f"Кошелёк: <code>{TON_WALLET}</code>\n"
         f"Memo: <code>{memo}</code>\n\n"
-        f"После оплаты напишите админу или дождитесь подтверждения.",
-        parse_mode="HTML"
+        f"После оплаты админ должен подтвердить платёж."
     )
+
+    await message.answer(text, parse_mode="HTML")
 
     await bot.send_message(
         ADMIN_ID,
@@ -195,8 +187,8 @@ async def confirm_topup(callback: types.CallbackQuery):
         _, uid_str, amt_str = callback.data.split("_")
         uid = int(uid_str)
         amt = int(amt_str)
-    except:
-        await callback.answer("Ошибка в данных", show_alert=True)
+    except Exception:
+        await callback.answer("Ошибка формата данных", show_alert=True)
         return
 
     cur.execute(
@@ -220,17 +212,12 @@ async def buy_ticket(callback: types.CallbackQuery):
     row = cur.fetchone()
 
     if not row or row[0] < COST_PER_TICKET:
-        await callback.message.answer("❌ Недостаточно средств на балансе")
+        await callback.message.answer("❌ Недостаточно средств")
         await callback.answer()
         return
 
     cur.execute(
-        """
-        UPDATE users
-        SET balance = balance - ?,
-            tickets = tickets + 1
-        WHERE user_id = ?
-        """,
+        "UPDATE users SET balance = balance - ?, tickets = tickets + 1 WHERE user_id = ?",
         (COST_PER_TICKET, callback.from_user.id)
     )
     conn.commit()
@@ -241,10 +228,7 @@ async def buy_ticket(callback: types.CallbackQuery):
 
 @dp.callback_query(lambda c: c.data == "balance")
 async def show_balance(callback: types.CallbackQuery):
-    cur.execute(
-        "SELECT balance, tickets FROM users WHERE user_id = ?",
-        (callback.from_user.id,)
-    )
+    cur.execute("SELECT balance, tickets FROM users WHERE user_id = ?", (callback.from_user.id,))
     row = cur.fetchone()
     bal, tik = row if row else (0, 0)
 
@@ -260,26 +244,18 @@ async def referral_link(callback: types.CallbackQuery):
     await callback.answer()
 
 
-@dp.callback_query(lambda c: c.data in ("admin_start", "admin_stop", "set_prize", "admin_view_balances"))
-async def admin_buttons(callback: types.CallbackQuery):
-    if callback.from_user.id != ADMIN_ID:
-        await callback.answer("Только для администратора", show_alert=True)
-        return
-
-    data = callback.data
-
-    if data == "admin_start":
-        await callback.message.answer("Логика запуска конкурса пока не реализована")
-    elif data == "admin_stop":
-        await callback.message.answer("Логика остановки конкурса пока не реализована")
-    elif data == "set_prize":
-        await callback.message.answer("Логика установки приза пока не реализована")
-    elif data == "admin_view_balances":
-        await callback.message.answer("Логика просмотра балансов пока не реализована")
-
+@dp.callback_query()
+async def catch_all_callbacks(callback: types.CallbackQuery):
+    if callback.from_user.id == ADMIN_ID and callback.data in {
+        "admin_start", "admin_stop", "set_prize", "admin_view_balances"
+    }:
+        await callback.message.answer(f"Функция {callback.data} пока не реализована")
+    else:
+        await callback.answer("Кнопка пока не обрабатывается", show_alert=True)
     await callback.answer()
 
-# ──────────────────── FAKE WEB SERVER (для Render / Railway и т.п.) ───────
+
+# ──────────────────── FAKE WEB SERVER (обязателен для Render Free / Hobby) ─────
 
 async def fake_web_server():
     async def handle(request):
@@ -287,6 +263,7 @@ async def fake_web_server():
 
     app = web.Application()
     app.router.add_get("/", handle)
+    app.router.add_get("/health", handle)
 
     runner = web.AppRunner(app)
     await runner.setup()
@@ -294,17 +271,32 @@ async def fake_web_server():
     port = int(os.environ.get("PORT", 10000))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    print(f"Fake web server running on port {port}")
+    print(f"Fake web server started → http://0.0.0.0:{port}")
 
 
 # ──────────────────── ЗАПУСК ────────────────────
 
 async def main():
     print("Бот запускается...")
-    await asyncio.gather(
-        fake_web_server(),
-        dp.start_polling(bot, allowed_updates=types.AllowedUpdates.MESSAGE + types.AllowedUpdates.CALLBACK_QUERY)
+
+    # Запускаем два процесса параллельно
+    polling_task = asyncio.create_task(
+        dp.start_polling(
+            bot,
+            allowed_updates=["message", "callback_query"],
+            drop_pending_updates=True
+        )
     )
 
+    web_task = asyncio.create_task(fake_web_server())
+
+    await asyncio.gather(polling_task, web_task, return_exceptions=True)
+
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        print("Бот остановлен")
+    finally:
+        asyncio.run(bot.session.close())
