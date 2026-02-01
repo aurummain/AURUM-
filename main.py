@@ -14,11 +14,8 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 # ──────────────────── НАСТРОЙКИ ────────────────────
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-if not BOT_TOKEN:
-    raise ValueError("BOT_TOKEN не найден в переменных окружения! Добавь его в Render → Environment")
-
+BOT_TOKEN = "8323563478:AAE9qcdBfdvO1ptKkCXS78hJ4SuxeFOnV2w"
 ADMIN_ID = 1333099097
 TON_WALLET = "UQBJNtgVfE-x7-K1uY_EhW1rdvGKhq5gM244fX89VF0bof7R"
 
