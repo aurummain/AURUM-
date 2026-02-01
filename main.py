@@ -14,7 +14,6 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 # ──────────────────── НАСТРОЙКИ ────────────────────
 
-
 BOT_TOKEN = "8323563478:AAE9qcdBfdvO1ptKkCXS78hJ4SuxeFOnV2w"
 ADMIN_ID = 1333099097
 TON_WALLET = "UQBJNtgVfE-x7-K1uY_EhW1rdvGKhq5gM244fX89VF0bof7R"
@@ -32,6 +31,9 @@ class TopUpState(StatesGroup):
 
 class SetPrizeState(StatesGroup):
     waiting_prize = State()
+
+class BuyTicketsState(StatesGroup):
+    waiting_quantity = State()
 
 # ──────────────────── БАЗА ДАННЫХ ────────────────────
 
@@ -72,9 +74,10 @@ timer_task: asyncio.Task | None = None
 def user_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💳 Пополнить", callback_data="topup")],
-        [InlineKeyboardButton(text="🎟 Купить билет", callback_data="buy")],
+        [InlineKeyboardButton(text="🎟 Купить билеты", callback_data="buy")],
         [InlineKeyboardButton(text="📊 Баланс", callback_data="balance")],
         [InlineKeyboardButton(text="🤝 Реф. ссылка", callback_data="ref")],
+        [InlineKeyboardButton(text="📈 Статистика шансов", callback_data="stats")],
     ])
 
 def admin_kb():
@@ -235,17 +238,39 @@ async def reject_topup(callback: types.CallbackQuery):
     await callback.answer()
 
 @dp.callback_query(lambda c: c.data == "buy")
-async def buy_ticket(callback: types.CallbackQuery):
+async def start_buy_tickets(callback: types.CallbackQuery, state: FSMContext):
+    if callback.message.chat.type != "private":
+        await callback.answer("Только в ЛС", show_alert=True)
+        return
     uid = callback.from_user.id
     cur.execute("SELECT balance FROM users WHERE user_id = ?", (uid,))
     row = cur.fetchone()
     if not row or row[0] < COST_PER_TICKET:
-        await callback.answer("Недостаточно средств", show_alert=True)
+        await callback.answer("Недостаточно средств для покупки хотя бы одного билета", show_alert=True)
+        return
+    await callback.message.answer("Введите количество билетов для покупки:")
+    await state.set_state(BuyTicketsState.waiting_quantity)
+    await callback.answer()
+
+@dp.message(BuyTicketsState.waiting_quantity)
+async def process_buy_tickets(message: types.Message, state: FSMContext):
+    if not message.text.isdigit() or int(message.text) <= 0:
+        await message.answer("Введите положительное целое число")
+        return
+
+    quantity = int(message.text)
+    cost = quantity * COST_PER_TICKET
+    uid = message.from_user.id
+    cur.execute("SELECT balance FROM users WHERE user_id = ?", (uid,))
+    row = cur.fetchone()
+    if not row or row[0] < cost:
+        await message.answer(f"Недостаточно средств. Требуется {cost} AUR, доступно {row[0]} AUR")
+        await state.clear()
         return
 
     cur.execute(
-        "UPDATE users SET balance = balance - ?, tickets = tickets + 1 WHERE user_id = ?",
-        (COST_PER_TICKET, uid)
+        "UPDATE users SET balance = balance - ?, tickets = tickets + ? WHERE user_id = ?",
+        (cost, quantity, uid)
     )
     conn.commit()
 
@@ -256,19 +281,25 @@ async def buy_ticket(callback: types.CallbackQuery):
         try:
             await bot.send_message(
                 announce_chat_id,
-                f"✨ Участник купил билет • Всего билетов в розыгрыше: {total}"
+                f"✨ Участник купил {quantity} билет(ов) • Всего билетов в розыгрыше: {total}"
             )
         except Exception as e:
             print(f"Ошибка отправки в чат: {e}")
 
-    await callback.message.answer("🎟 Билет куплен!")
-    await callback.answer()
+    await message.answer(f"🎟 Куплено {quantity} билет(ов)!")
+    await state.clear()
 
 @dp.callback_query(lambda c: c.data == "balance")
 async def balance(callback: types.CallbackQuery):
     cur.execute("SELECT balance, tickets FROM users WHERE user_id = ?", (callback.from_user.id,))
     bal, tik = cur.fetchone() or (0, 0)
-    await callback.message.answer(f"💰 {bal} AUR\n🎟 {tik}")
+    cur.execute("SELECT SUM(tickets) FROM users")
+    total_tickets = cur.fetchone()[0] or 0
+    if total_tickets > 0:
+        win_prob = (tik / total_tickets) * 100
+        await callback.message.answer(f"💰 {bal} AUR\n🎟 {tik}\nШанс на победу: {win_prob:.2f}%")
+    else:
+        await callback.message.answer(f"💰 {bal} AUR\n🎟 {tik}\nШанс на победу: 0% (нет билетов в розыгрыше)")
     await callback.answer()
 
 @dp.callback_query(lambda c: c.data == "ref")
@@ -277,6 +308,34 @@ async def ref(callback: types.CallbackQuery):
     await callback.message.answer(
         f"https://t.me/{me.username}?start={callback.from_user.id}"
     )
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data == "stats")
+async def stats(callback: types.CallbackQuery):
+    cur.execute("SELECT is_active FROM contest WHERE id = 1")
+    is_active = cur.fetchone()[0]
+    if not is_active:
+        await callback.answer("Нет активного конкурса", show_alert=True)
+        return
+
+    cur.execute("SELECT user_id, username, tickets FROM users WHERE tickets > 0 ORDER BY tickets DESC")
+    rows = cur.fetchall()
+    cur.execute("SELECT SUM(tickets) FROM users")
+    total_tickets = cur.fetchone()[0] or 0
+
+    if total_tickets == 0:
+        await callback.message.answer("Нет купленных билетов")
+        await callback.answer()
+        return
+
+    text = "📈 Статистика шансов на победу:\n"
+    for uid, username, tickets in rows:
+        prob = (tickets / total_tickets) * 100
+        text += f"@{username or uid}: {tickets} билетов ({prob:.2f}%)\n"
+
+    text += f"\nВсего билетов: {total_tickets}"
+
+    await callback.message.answer(text)
     await callback.answer()
 
 # ──────────────────── АДМИН ФУНКЦИИ ────────────────────
