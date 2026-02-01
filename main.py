@@ -2,9 +2,9 @@ import asyncio
 import os
 import sqlite3
 import random
-import aiohttp
 from datetime import datetime, timedelta
 
+import aiohttp
 from aiohttp import web
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
@@ -14,21 +14,20 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 # ──────────────────── НАСТРОЙКИ ────────────────────
 
-BOT_TOKEN = "import os
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-import os  # ← импортируем модуль ОС
+if not BOT_TOKEN:
+    raise ValueError("BOT_TOKEN не найден в переменных окружения! Добавь его в Render → Environment")
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")  # ← получаем токен из переменной окружения
 ADMIN_ID = 1333099097
 TON_WALLET = "UQBJNtgVfE-x7-K1uY_EhW1rdvGKhq5gM244fX89VF0bof7R"
 
 COST_PER_TICKET = 10000
 DEFAULT_CONTEST_MINUTES = 10
-TIMER_UPDATE_INTERVAL = 15  # секунд — оптимально
+TIMER_UPDATE_INTERVAL = 15
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
-
 # ──────────────────── FSM ────────────────────
 
 class TopUpState(StatesGroup):
