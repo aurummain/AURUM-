@@ -18,7 +18,7 @@ BOT_TOKEN = "8323563478:AAE9qcdBfdvO1ptKkCXS78hJ4SuxeFOnV2w"
 ADMIN_ID = 1333099097
 TON_WALLET = "UQBJNtgVfE-x7-K1uY_EhW1rdvGKhq5gM244fX89VF0bof7R"
 
-COST_PER_TICKET = 10000
+DEFAULT_COST_PER_TICKET = 10000
 DEFAULT_CONTEST_MINUTES = 10
 TIMER_UPDATE_INTERVAL = 15
 
@@ -34,6 +34,12 @@ class SetPrizeState(StatesGroup):
 
 class BuyTicketsState(StatesGroup):
     waiting_quantity = State()
+
+class SetDurationState(StatesGroup):
+    waiting_duration = State()
+
+class SetCostState(StatesGroup):
+    waiting_cost = State()
 
 # ──────────────────── БАЗА ДАННЫХ ────────────────────
 
@@ -56,10 +62,12 @@ CREATE TABLE IF NOT EXISTS contest (
     id INTEGER PRIMARY KEY,
     prize TEXT,
     is_active INTEGER DEFAULT 0,
-    end_time TEXT
+    end_time TEXT,
+    duration_minutes INTEGER DEFAULT 10,
+    cost_per_ticket INTEGER DEFAULT 10000
 )
 """)
-cur.execute("INSERT OR IGNORE INTO contest (id, is_active) VALUES (1, 0)")
+cur.execute("INSERT OR IGNORE INTO contest (id, is_active, duration_minutes, cost_per_ticket) VALUES (1, 0, 10, 10000)")
 
 conn.commit()
 
@@ -85,6 +93,8 @@ def admin_kb():
         [InlineKeyboardButton(text="▶️ Запустить конкурс", callback_data="admin_start")],
         [InlineKeyboardButton(text="⏹ Остановить конкурс", callback_data="admin_stop")],
         [InlineKeyboardButton(text="🏆 Установить приз", callback_data="set_prize")],
+        [InlineKeyboardButton(text="⏰ Установить время раунда", callback_data="set_duration")],
+        [InlineKeyboardButton(text="💰 Установить стоимость билета", callback_data="set_cost")],
         [InlineKeyboardButton(text="👥 Балансы игроков", callback_data="admin_view_balances")],
     ])
 
@@ -245,8 +255,10 @@ async def start_buy_tickets(callback: types.CallbackQuery, state: FSMContext):
     uid = callback.from_user.id
     cur.execute("SELECT balance FROM users WHERE user_id = ?", (uid,))
     row = cur.fetchone()
-    if not row or row[0] < COST_PER_TICKET:
-        await callback.answer("Недостаточно средств для покупки хотя бы одного билета", show_alert=True)
+    cur.execute("SELECT cost_per_ticket FROM contest WHERE id = 1")
+    cost_per_ticket = cur.fetchone()[0]
+    if not row or row[0] < cost_per_ticket:
+        await callback.answer(f"Недостаточно средств для покупки хотя бы одного билета (стоимость: {cost_per_ticket} AUR)", show_alert=True)
         return
     await callback.message.answer("Введите количество билетов для покупки:")
     await state.set_state(BuyTicketsState.waiting_quantity)
@@ -259,7 +271,9 @@ async def process_buy_tickets(message: types.Message, state: FSMContext):
         return
 
     quantity = int(message.text)
-    cost = quantity * COST_PER_TICKET
+    cur.execute("SELECT cost_per_ticket FROM contest WHERE id = 1")
+    cost_per_ticket = cur.fetchone()[0]
+    cost = quantity * cost_per_ticket
     uid = message.from_user.id
     cur.execute("SELECT balance FROM users WHERE user_id = ?", (uid,))
     row = cur.fetchone()
@@ -431,16 +445,17 @@ async def admin_start(callback: types.CallbackQuery):
         await callback.answer()
         return
 
-    cur.execute("SELECT prize FROM contest WHERE id = 1")
-    row = cur.fetchone()  # ← один вызов!
-    prize = row[0] if row else "Приз не установлен"
+    cur.execute("SELECT prize, duration_minutes FROM contest WHERE id = 1")
+    row = cur.fetchone()
+    prize = row[0] if row[0] else "Приз не установлен"
+    duration_minutes = row[1]
 
-    end_time = (datetime.utcnow() + timedelta(minutes=DEFAULT_CONTEST_MINUTES)).isoformat()
+    end_time = (datetime.utcnow() + timedelta(minutes=duration_minutes)).isoformat()
 
     cur.execute("UPDATE contest SET is_active = 1, end_time = ? WHERE id = 1", (end_time,))
     conn.commit()
 
-    initial_text = f"🎉 Конкурс запущен!\nПриз: {prize}\nОсталось: {DEFAULT_CONTEST_MINUTES:02d}:00\nБилетов: 0"
+    initial_text = f"🎉 Конкурс запущен!\nПриз: {prize}\nОсталось: {duration_minutes:02d}:00\nБилетов: 0"
 
     msg = await bot.send_message(announce_chat_id, initial_text, reply_markup=await contest_kb())
     announce_message_id = msg.message_id
@@ -492,6 +507,50 @@ async def process_prize(message: types.Message, state: FSMContext):
     cur.execute("UPDATE contest SET prize = ? WHERE id = 1", (prize,))
     conn.commit()
     await message.answer(f"Приз установлен: {prize}")
+    await state.clear()
+
+@dp.callback_query(lambda c: c.data == "set_duration")
+async def admin_set_duration(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    await callback.message.answer("Введите продолжительность раунда в минутах:")
+    await state.set_state(SetDurationState.waiting_duration)
+    await callback.answer()
+
+@dp.message(SetDurationState.waiting_duration)
+async def process_duration(message: types.Message, state: FSMContext):
+    if not message.text.isdigit() or int(message.text) <= 0:
+        await message.answer("Введите положительное целое число")
+        return
+
+    duration = int(message.text)
+    cur.execute("UPDATE contest SET duration_minutes = ? WHERE id = 1", (duration,))
+    conn.commit()
+    await message.answer(f"Продолжительность раунда установлена: {duration} минут")
+    await state.clear()
+
+@dp.callback_query(lambda c: c.data == "set_cost")
+async def admin_set_cost(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    await callback.message.answer("Введите стоимость одного билета в AUR:")
+    await state.set_state(SetCostState.waiting_cost)
+    await callback.answer()
+
+@dp.message(SetCostState.waiting_cost)
+async def process_cost(message: types.Message, state: FSMContext):
+    if not message.text.isdigit() or int(message.text) <= 0:
+        await message.answer("Введите положительное целое число")
+        return
+
+    cost = int(message.text)
+    cur.execute("UPDATE contest SET cost_per_ticket = ? WHERE id = 1", (cost,))
+    conn.commit()
+    await message.answer(f"Стоимость билета установлена: {cost} AUR")
     await state.clear()
 
 @dp.callback_query(lambda c: c.data == "admin_view_balances")
