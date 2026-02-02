@@ -127,6 +127,14 @@ async def cmd_start(message: types.Message):
     )
     conn.commit()
 
+    # Уведомление рефереру о новом реферале
+    if referrer_id:
+        try:
+            referrer_username = user.username or f"ID{user.id}"
+            await bot.send_message(referrer_id, f"У вас новый реферал: @{referrer_username}")
+        except Exception as e:
+            print(f"Ошибка уведомления реферера: {e}")
+
     cur.execute("SELECT is_active, prize, end_time FROM contest WHERE id = 1")
     row = cur.fetchone()
     is_active, prize, end_time = row if row else (0, None, None)
@@ -275,17 +283,32 @@ async def process_buy_tickets(message: types.Message, state: FSMContext):
     cost_per_ticket = cur.fetchone()[0]
     cost = quantity * cost_per_ticket
     uid = message.from_user.id
-    cur.execute("SELECT balance FROM users WHERE user_id = ?", (uid,))
+    cur.execute("SELECT balance, referrer_id, rewarded_referrer FROM users WHERE user_id = ?", (uid,))
     row = cur.fetchone()
     if not row or row[0] < cost:
         await message.answer(f"Недостаточно средств. Требуется {cost} AUR, доступно {row[0]} AUR")
         await state.clear()
         return
 
+    # Обновление баланса и билетов покупателя
     cur.execute(
         "UPDATE users SET balance = balance - ?, tickets = tickets + ? WHERE user_id = ?",
         (cost, quantity, uid)
     )
+
+    # Начисление реферального билета, если это первая покупка и есть реферер
+    referrer_id, rewarded = row[1], row[2]
+    if referrer_id and rewarded == 0:
+        cur.execute("UPDATE users SET tickets = tickets + 1 WHERE user_id = ?", (referrer_id,))
+        cur.execute("UPDATE users SET rewarded_referrer = 1 WHERE user_id = ?", (uid,))
+        
+        # Уведомления
+        buyer_username = message.from_user.username or f"ID{uid}"
+        try:
+            await bot.send_message(referrer_id, f"Ваш реферал @{buyer_username} купил билет — вы получили 1 билет!")
+        except Exception as e:
+            print(f"Ошибка уведомления реферера: {e}")
+
     conn.commit()
 
     cur.execute("SELECT SUM(tickets) FROM users")
