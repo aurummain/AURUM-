@@ -19,7 +19,8 @@ BOT_TOKEN = "8323563478:AAE9qcdBfdvO1ptKkCXS78hJ4SuxeFOnV2w"
 ADMIN_ID = 1333099097
 TON_WALLET = "UQBJNtgVfE-x7-K1uY_EhW1rdvGKhq5gM244fX89VF0bof7R"
 
-DEFAULT_COST_PER_TICKET = 10000
+DEFAULT_COST_PER_TICKET_AUR = 10000
+DEFAULT_COST_PER_TICKET_TON = 1
 DEFAULT_CONTEST_MINUTES = 10
 TIMER_UPDATE_INTERVAL = 15
 RATE_LIMIT_WINDOW = 60  # Окно в секундах (1 минута)
@@ -43,12 +44,16 @@ class SetPrizesState(StatesGroup):
     waiting_prizes = State()
 
 class BuyTicketsState(StatesGroup):
+    waiting_currency = State()
     waiting_quantity = State()
 
 class SetDurationState(StatesGroup):
     waiting_duration = State()
 
-class SetCostState(StatesGroup):
+class SetCostAurState(StatesGroup):
+    waiting_cost = State()
+
+class SetCostTonState(StatesGroup):
     waiting_cost = State()
 
 # ──────────────────── БАЗА ДАННЫХ ────────────────────
@@ -60,7 +65,8 @@ cur.execute("""
 CREATE TABLE IF NOT EXISTS users (
     user_id INTEGER PRIMARY KEY,
     username TEXT,
-    balance INTEGER DEFAULT 0,
+    aur_balance INTEGER DEFAULT 0,
+    ton_balance INTEGER DEFAULT 0,
     tickets INTEGER DEFAULT 0,
     referrer_id INTEGER,
     rewarded_referrer INTEGER DEFAULT 0
@@ -74,11 +80,12 @@ CREATE TABLE IF NOT EXISTS contest (
     is_active INTEGER DEFAULT 0,
     end_time TEXT,
     duration_minutes INTEGER DEFAULT 10,
-    cost_per_ticket INTEGER DEFAULT 10000,
+    cost_per_ticket_aur INTEGER DEFAULT 10000,
+    cost_per_ticket_ton INTEGER DEFAULT 1,
     prize_message_ids TEXT DEFAULT '[]'  -- JSON список message_id для призов
 )
 """)
-cur.execute("INSERT OR IGNORE INTO contest (id, is_active, duration_minutes, cost_per_ticket) VALUES (1, 0, 10, 10000)")
+cur.execute("INSERT OR IGNORE INTO contest (id, is_active, duration_minutes, cost_per_ticket_aur, cost_per_ticket_ton) VALUES (1, 0, 10, 10000, 1)")
 
 conn.commit()
 
@@ -154,7 +161,8 @@ def admin_kb():
         [InlineKeyboardButton(text="⏹ Остановить конкурс", callback_data="admin_stop")],
         [InlineKeyboardButton(text="🏆 Установить призы", callback_data="set_prizes")],
         [InlineKeyboardButton(text="⏰ Установить время раунда", callback_data="set_duration")],
-        [InlineKeyboardButton(text="💰 Установить стоимость билета", callback_data="set_cost")],
+        [InlineKeyboardButton(text="💰 Установить стоимость билета AUR", callback_data="set_cost_aur")],
+        [InlineKeyboardButton(text="💰 Установить стоимость билета TON", callback_data="set_cost_ton")],
         [InlineKeyboardButton(text="👥 Балансы игроков", callback_data="admin_view_balances")],
     ])
 
@@ -167,10 +175,10 @@ async def contest_kb():
         )],
     ])
 
-def confirm_topup_kb(user_id: int, amount: int):
+def confirm_topup_kb(user_id: int, amount: int, currency: str):
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"✅ Подтвердить {amount}", callback_data=f"confirm_{user_id}_{amount}")],
-        [InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_{user_id}_{amount}")]
+        [InlineKeyboardButton(text=f"✅ Подтвердить {amount} {currency}", callback_data=f"confirm_{user_id}_{amount}_{currency}")],
+        [InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_{user_id}_{amount}_{currency}")]
     ])
 
 # ──────────────────── HANDLERS ────────────────────
@@ -298,7 +306,7 @@ async def process_topup_amount(message: types.Message, state: FSMContext):
     await bot.send_message(
         ADMIN_ID,
         f"🟢 Запрос пополнения\nОт: {message.from_user.id}\nВалюта: {currency}\nСумма: {amount}",
-        reply_markup=confirm_topup_kb(message.from_user.id, amount)
+        reply_markup=confirm_topup_kb(message.from_user.id, amount, currency)
     )
 
     await state.clear()
@@ -310,20 +318,27 @@ async def confirm_topup(callback: types.CallbackQuery):
         return
 
     try:
-        _, uid_str, amt_str = callback.data.split("_")
+        _, uid_str, amt_str, currency = callback.data.split("_")
         uid, amt = int(uid_str), int(amt_str)
     except:
         await callback.answer("Ошибка данных", show_alert=True)
         return
 
-    cur.execute(
-        "INSERT INTO users (user_id, balance) VALUES (?, ?) "
-        "ON CONFLICT(user_id) DO UPDATE SET balance = balance + ?",
-        (uid, amt, amt)
-    )
+    if currency == "AUR":
+        cur.execute(
+            "INSERT INTO users (user_id, aur_balance) VALUES (?, ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET aur_balance = aur_balance + ?",
+            (uid, amt, amt)
+        )
+    else:
+        cur.execute(
+            "INSERT INTO users (user_id, ton_balance) VALUES (?, ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET ton_balance = ton_balance + ?",
+            (uid, amt, amt)
+        )
     conn.commit()
 
-    await bot.send_message(uid, f"✅ Баланс пополнен на {amt} AUR")
+    await bot.send_message(uid, f"✅ Баланс пополнен на {amt} {currency}")
     await callback.message.edit_text(callback.message.text + "\n\n✅ Подтверждено")
     await callback.answer()
 
@@ -334,14 +349,14 @@ async def reject_topup(callback: types.CallbackQuery):
         return
 
     try:
-        _, uid_str, amt_str = callback.data.split("_")
+        _, uid_str, amt_str, currency = callback.data.split("_")
         uid = int(uid_str)
         amt = int(amt_str)
     except:
         await callback.answer("Ошибка", show_alert=True)
         return
 
-    await bot.send_message(uid, f"❌ Пополнение на {amt} AUR отклонено")
+    await bot.send_message(uid, f"❌ Пополнение на {amt} {currency} отклонено")
     await callback.message.edit_text(callback.message.text + "\n\n❌ Отклонено")
     await callback.answer()
 
@@ -353,15 +368,37 @@ async def start_buy_tickets(callback: types.CallbackQuery, state: FSMContext):
     if await check_rate_limit_and_ban(callback.from_user.id, "buy"):
         await callback.answer("Вы заблокированы за спам.", show_alert=True)
         return
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="За AUR", callback_data="buy_aur")],
+        [InlineKeyboardButton(text="За TON", callback_data="buy_ton")],
+    ])
+    await callback.message.answer("Выберите валюту для покупки билетов:", reply_markup=kb)
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data.startswith("buy_"))
+async def process_buy_currency(callback: types.CallbackQuery, state: FSMContext):
+    currency = callback.data.split("_")[1].upper()
+    await state.update_data(currency=currency)
+
     uid = callback.from_user.id
-    cur.execute("SELECT balance FROM users WHERE user_id = ?", (uid,))
-    row = cur.fetchone()
-    cur.execute("SELECT cost_per_ticket FROM contest WHERE id = 1")
-    cost_per_ticket = cur.fetchone()[0]
-    if not row or row[0] < cost_per_ticket:
-        await callback.answer(f"Недостаточно средств для покупки хотя бы одного билета (стоимость: {cost_per_ticket} AUR)", show_alert=True)
+    if currency == "AUR":
+        cur.execute("SELECT aur_balance FROM users WHERE user_id = ?", (uid,))
+        balance = cur.fetchone()[0] or 0
+        cur.execute("SELECT cost_per_ticket_aur FROM contest WHERE id = 1")
+        cost_per_ticket = cur.fetchone()[0]
+    else:
+        cur.execute("SELECT ton_balance FROM users WHERE user_id = ?", (uid,))
+        balance = cur.fetchone()[0] or 0
+        cur.execute("SELECT cost_per_ticket_ton FROM contest WHERE id = 1")
+        cost_per_ticket = cur.fetchone()[0]
+
+    if balance < cost_per_ticket:
+        await callback.answer(f"Недостаточно средств для покупки хотя бы одного билета (стоимость: {cost_per_ticket} {currency})", show_alert=True)
+        await state.clear()
         return
-    await callback.message.answer("Введите количество билетов для покупки:")
+
+    await callback.message.answer(f"Введите количество билетов для покупки за {currency}:")
     await state.set_state(BuyTicketsState.waiting_quantity)
     await callback.answer()
 
@@ -374,22 +411,43 @@ async def process_buy_tickets(message: types.Message, state: FSMContext):
         await message.answer("Введите положительное целое число")
         return
 
+    data = await state.get_data()
+    currency = data.get("currency", "AUR")
+
     quantity = int(message.text)
-    cur.execute("SELECT cost_per_ticket FROM contest WHERE id = 1")
-    cost_per_ticket = cur.fetchone()[0]
+    if currency == "AUR":
+        cur.execute("SELECT cost_per_ticket_aur FROM contest WHERE id = 1")
+        cost_per_ticket = cur.fetchone()[0]
+    else:
+        cur.execute("SELECT cost_per_ticket_ton FROM contest WHERE id = 1")
+        cost_per_ticket = cur.fetchone()[0]
     cost = quantity * cost_per_ticket
     uid = message.from_user.id
-    cur.execute("SELECT balance, referrer_id, rewarded_referrer FROM users WHERE user_id = ?", (uid,))
-    row = cur.fetchone()
-    if not row or row[0] < cost:
-        await message.answer(f"Недостаточно средств. Требуется {cost} AUR, доступно {row[0]} AUR")
+    if currency == "AUR":
+        cur.execute("SELECT aur_balance, referrer_id, rewarded_referrer FROM users WHERE user_id = ?", (uid,))
+        row = cur.fetchone()
+        balance = row[0]
+    else:
+        cur.execute("SELECT ton_balance, referrer_id, rewarded_referrer FROM users WHERE user_id = ?", (uid,))
+        row = cur.fetchone()
+        balance = row[0]
+        referrer_id, rewarded = row[1], row[2]
+
+    if balance < cost:
+        await message.answer(f"Недостаточно средств. Требуется {cost} {currency}, доступно {balance} {currency}")
         await state.clear()
         return
 
-    cur.execute(
-        "UPDATE users SET balance = balance - ?, tickets = tickets + ? WHERE user_id = ?",
-        (cost, quantity, uid)
-    )
+    if currency == "AUR":
+        cur.execute(
+            "UPDATE users SET aur_balance = aur_balance - ?, tickets = tickets + ? WHERE user_id = ?",
+            (cost, quantity, uid)
+        )
+    else:
+        cur.execute(
+            "UPDATE users SET ton_balance = ton_balance - ?, tickets = tickets + ? WHERE user_id = ?",
+            (cost, quantity, uid)
+        )
 
     referrer_id, rewarded = row[1], row[2]
     if referrer_id and rewarded == 0:
@@ -416,7 +474,7 @@ async def process_buy_tickets(message: types.Message, state: FSMContext):
         except Exception as e:
             print(f"Ошибка отправки в чат: {e}")
 
-    await message.answer(f"🎟 Куплено {quantity} билет(ов)!")
+    await message.answer(f"🎟 Куплено {quantity} билет(ов) за {cost} {currency}!")
     await state.clear()
 
 @dp.callback_query(lambda c: c.data == "balance")
@@ -424,15 +482,15 @@ async def balance(callback: types.CallbackQuery):
     if await check_rate_limit_and_ban(callback.from_user.id, "balance"):
         await callback.answer("Вы заблокированы за спам.", show_alert=True)
         return
-    cur.execute("SELECT balance, tickets FROM users WHERE user_id = ?", (callback.from_user.id,))
-    bal, tik = cur.fetchone() or (0, 0)
+    cur.execute("SELECT aur_balance, ton_balance, tickets FROM users WHERE user_id = ?", (callback.from_user.id,))
+    aur, ton, tik = cur.fetchone() or (0, 0, 0)
     cur.execute("SELECT SUM(tickets) FROM users")
     total_tickets = cur.fetchone()[0] or 0
     if total_tickets > 0:
         win_prob = (tik / total_tickets) * 100
-        await callback.message.answer(f"💰 {bal} AUR\n🎟 {tik}\nШанс на победу: {win_prob:.2f}%")
+        await callback.message.answer(f"💰 {aur} AUR | {ton} TON\n🎟 {tik}\nШанс на победу: {win_prob:.2f}%")
     else:
-        await callback.message.answer(f"💰 {bal} AUR\n🎟 {tik}\nШанс на победу: 0% (нет билетов в розыгрыше)")
+        await callback.message.answer(f"💰 {aur} AUR | {ton} TON\n🎟 {tik}\nШанс на победу: 0% (нет билетов в розыгрыше)")
     await callback.answer()
 
 @dp.callback_query(lambda c: c.data == "ref")
@@ -669,26 +727,48 @@ async def process_duration(message: types.Message, state: FSMContext):
     await message.answer(f"Продолжительность раунда установлена: {duration} минут")
     await state.clear()
 
-@dp.callback_query(lambda c: c.data == "set_cost")
-async def admin_set_cost(callback: types.CallbackQuery, state: FSMContext):
+@dp.callback_query(lambda c: c.data == "set_cost_aur")
+async def admin_set_cost_aur(callback: types.CallbackQuery, state: FSMContext):
     if callback.from_user.id != ADMIN_ID:
         await callback.answer("Нет доступа", show_alert=True)
         return
 
     await callback.message.answer("Введите стоимость одного билета в AUR:")
-    await state.set_state(SetCostState.waiting_cost)
+    await state.set_state(SetCostAurState.waiting_cost)
     await callback.answer()
 
-@dp.message(SetCostState.waiting_cost)
-async def process_cost(message: types.Message, state: FSMContext):
+@dp.message(SetCostAurState.waiting_cost)
+async def process_cost_aur(message: types.Message, state: FSMContext):
     if not message.text.isdigit() or int(message.text) <= 0:
         await message.answer("Введите положительное целое число")
         return
 
     cost = int(message.text)
-    cur.execute("UPDATE contest SET cost_per_ticket = ? WHERE id = 1", (cost,))
+    cur.execute("UPDATE contest SET cost_per_ticket_aur = ? WHERE id = 1", (cost,))
     conn.commit()
-    await message.answer(f"Стоимость билета установлена: {cost} AUR")
+    await message.answer(f"Стоимость билета в AUR установлена: {cost} AUR")
+    await state.clear()
+
+@dp.callback_query(lambda c: c.data == "set_cost_ton")
+async def admin_set_cost_ton(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    await callback.message.answer("Введите стоимость одного билета в TON:")
+    await state.set_state(SetCostTonState.waiting_cost)
+    await callback.answer()
+
+@dp.message(SetCostTonState.waiting_cost)
+async def process_cost_ton(message: types.Message, state: FSMContext):
+    if not message.text.isdigit() or int(message.text) <= 0:
+        await message.answer("Введите положительное целое число")
+        return
+
+    cost = int(message.text)
+    cur.execute("UPDATE contest SET cost_per_ticket_ton = ? WHERE id = 1", (cost,))
+    conn.commit()
+    await message.answer(f"Стоимость билета в TON установлена: {cost} TON")
     await state.clear()
 
 @dp.callback_query(lambda c: c.data == "admin_view_balances")
@@ -697,12 +777,12 @@ async def admin_view_balances(callback: types.CallbackQuery):
         await callback.answer("Нет доступа", show_alert=True)
         return
 
-    cur.execute("SELECT user_id, username, balance, tickets FROM users")
+    cur.execute("SELECT user_id, username, aur_balance, ton_balance, tickets FROM users")
     rows = cur.fetchall()
     if not rows:
         await callback.message.answer("Нет игроков")
     else:
-        text = "Балансы:\n" + "\n".join([f"@{r[1] or f'ID{r[0]}'}: {r[2]} AUR, {r[3]} билетов" for r in rows])
+        text = "Балансы:\n" + "\n".join([f"@{r[1] or f'ID{r[0]}'}: {r[2]} AUR, {r[3]} TON, {r[4]} билетов" for r in rows])
         await callback.message.answer(text)
     await callback.answer()
 
