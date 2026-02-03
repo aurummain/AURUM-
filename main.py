@@ -711,7 +711,7 @@ async def toggle_winner(callback: types.CallbackQuery, state: FSMContext):
     num_prizes = data.get('num_prizes', 1)
 
     if callback.data.startswith("toggle_winner_"):
-        username = callback.data.split("_", 2)[2]
+        username = callback.data.replace("toggle_winner_", "")
         if username in selected:
             selected.remove(username)
         else:
