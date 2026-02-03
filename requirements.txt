@@ -1,2 +1,1 @@
 aiogram
-pip install --upgrade pip
