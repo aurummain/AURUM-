@@ -50,9 +50,6 @@ class SetDurationState(StatesGroup):
 class SetCostState(StatesGroup):
     waiting_cost = State()
 
-class SelectWinnersState(StatesGroup):
-    selecting = State()
-
 # ──────────────────── БАЗА ДАННЫХ ────────────────────
 
 conn = sqlite3.connect("lottery.db", check_same_thread=False)
@@ -158,7 +155,6 @@ def admin_kb():
         [InlineKeyboardButton(text="🏆 Установить призы", callback_data="set_prizes")],
         [InlineKeyboardButton(text="⏰ Установить время раунда", callback_data="set_duration")],
         [InlineKeyboardButton(text="💰 Установить стоимость билета", callback_data="set_cost")],
-        [InlineKeyboardButton(text="🏅 Выбрать победителей", callback_data="select_winners")],
         [InlineKeyboardButton(text="👥 Балансы игроков", callback_data="admin_view_balances")],
     ])
 
@@ -176,15 +172,6 @@ def confirm_topup_kb(user_id: int, amount: int):
         [InlineKeyboardButton(text=f"✅ Подтвердить {amount}", callback_data=f"confirm_{user_id}_{amount}")],
         [InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_{user_id}_{amount}")]
     ])
-
-def get_select_winners_kb(participants, selected):
-    kb = []
-    for username in participants:
-        text = f"@{username}" + (" ✅" if username in selected else "")
-        cb_data = f"toggle_winner_{username}"
-        kb.append([InlineKeyboardButton(text=text, callback_data=cb_data)])
-    kb.append([InlineKeyboardButton(text="Подтвердить выбор", callback_data="confirm_winners")])
-    return InlineKeyboardMarkup(inline_keyboard=kb)
 
 # ──────────────────── HANDLERS ────────────────────
 
@@ -583,8 +570,8 @@ async def admin_start(callback: types.CallbackQuery):
 
     # Вторые сообщения: для каждого приза
     prize_message_ids = []
-    for prize in prizes:
-        prize_text = f"Приз: {prize}"  # Ссылка, если приз — URL, иначе текст
+    for i, prize in enumerate(prizes, start=1):
+        prize_text = f"{i}й приз: {prize}"  # Ссылка, если приз — URL, иначе текст
         prize_msg = await bot.send_message(announce_chat_id, prize_text)
         prize_message_ids.append(prize_msg.message_id)
 
@@ -689,68 +676,6 @@ async def process_cost(message: types.Message, state: FSMContext):
     await message.answer(f"Стоимость билета установлена: {cost} AUR")
     await state.clear()
 
-@dp.callback_query(lambda c: c.data == "select_winners")
-async def admin_select_winners(callback: types.CallbackQuery, state: FSMContext):
-    if callback.from_user.id != ADMIN_ID:
-        await callback.answer("Нет доступа", show_alert=True)
-        return
-
-    cur.execute("SELECT is_active FROM contest WHERE id = 1")
-    if not cur.fetchone()[0]:
-        await callback.answer("Нет активного конкурса", show_alert=True)
-        return
-
-    cur.execute("SELECT username FROM users WHERE tickets > 0 AND username IS NOT NULL")
-    participants = [row[0] for row in cur.fetchall()]
-
-    if not participants:
-        await callback.message.answer("Нет участников с билетами")
-        return
-
-    cur.execute("SELECT selected_winners, prizes FROM contest WHERE id = 1")
-    row = cur.fetchone()
-    selected_json = row[0] or '[]'
-    selected = json.loads(selected_json)
-    num_prizes = len(json.loads(row[1] or '[]'))
-
-    await state.update_data(participants=participants, selected=selected, num_prizes=num_prizes)
-    await callback.message.answer("Выберите победителей:", reply_markup=get_select_winners_kb(participants, selected))
-    await state.set_state(SelectWinnersState.selecting)
-
-@dp.callback_query(SelectWinnersState.selecting)
-async def toggle_winner(callback: types.CallbackQuery, state: FSMContext):
-    if callback.from_user.id != ADMIN_ID:
-        return
-
-    data = await state.get_data()
-    participants = data.get('participants', [])
-    selected = data.get('selected', [])
-    num_prizes = data.get('num_prizes', 1)
-
-    if callback.data.startswith("toggle_winner_"):
-        username = callback.data.replace("toggle_winner_", "")
-        if username in selected:
-            selected.remove(username)
-        else:
-            if len(selected) < num_prizes:
-                selected.append(username)
-            else:
-                await callback.answer(f"Максимум {num_prizes} победителей", show_alert=True)
-                return
-
-        await state.update_data(selected=selected)
-        await callback.message.edit_reply_markup(reply_markup=get_select_winners_kb(participants, selected))
-        await callback.answer()
-
-    elif callback.data == "confirm_winners":
-        selected_json = json.dumps(selected)
-        cur.execute("UPDATE contest SET selected_winners = ? WHERE id = 1", (selected_json,))
-        conn.commit()
-        winners_text = ', '.join(['@' + u for u in selected])
-        await callback.message.answer(f"Победители выбраны: {winners_text}")
-        await bot.send_message(ADMIN_ID, f"Победители выбраны: {winners_text}")
-        await state.clear()
-
 @dp.callback_query(lambda c: c.data == "admin_view_balances")
 async def admin_view_balances(callback: types.CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
@@ -820,13 +745,40 @@ async def perform_draw(total_tickets):
     prize_message_ids = json.loads(row[2] or '[]')
     num_prizes = len(prizes)
 
-    if selected:
-        winners = selected[:num_prizes]
+    if total_tickets == 0:
+        text = "Конкурс завершён. Никто не купил билеты."
+        winners = []
     else:
-        winners = []  # Нет автоматического выбора
+        cur.execute("SELECT user_id, tickets FROM users WHERE tickets > 0")
+        participants = cur.fetchall()
 
-    winners_text = ", ".join([f"@{w}" for w in winners]) if winners else "Нет победителей"
-    text = f"🎉 Конкурс завершён!\nПобедители: {winners_text}\nПоздравляем!"
+        pool = []
+        for uid, count in participants:
+            pool.extend([uid] * count)
+
+        winners_ids = set()
+        while len(winners_ids) < min(num_prizes, len(set(pool))):
+            winner_id = random.choice(pool)
+            winners_ids.add(winner_id)
+
+        winners = []
+        for wid in winners_ids:
+            cur.execute("SELECT username FROM users WHERE user_id = ?", (wid,))
+            w_username = cur.fetchone()[0]
+            if w_username:
+                winners.append(w_username)
+
+    if winners:
+        winners_text = ", ".join([f"@{w}" for w in winners])
+        text = f"🎉 Конкурс завершён!\nПобедители: {winners_text}\nПоздравляем!"
+        for i, winner in enumerate(winners):
+            prize = prizes[i] if i < len(prizes) else "Дополнительный приз"
+            winner_id = await get_user_id_by_username(winner)
+            if winner_id:
+                await bot.send_message(winner_id, f"🎉 Вы выиграли {prize}! Напишите админу.")
+        await bot.send_message(ADMIN_ID, f"Победители: {winners_text}")
+    else:
+        text = "Конкурс завершён. Нет победителей."
 
     await bot.edit_message_text(
         text,
@@ -839,13 +791,10 @@ async def perform_draw(total_tickets):
         if i < len(winners):
             winner = winners[i]
             winner_tickets, winner_prob = await get_winner_stats(winner, total_tickets)
-            edit_text = f"Победитель приза {prizes[i]}: @{winner} ({winner_tickets} билетов, {winner_prob:.2f}%)"
+            edit_text = f"{i+1}й приз: {prizes[i]} победил @{winner} ({winner_tickets} билетов, {winner_prob:.2f}%)"
             await bot.edit_message_text(edit_text, chat_id=announce_chat_id, message_id=mid)
-            winner_id = await get_user_id_by_username(winner)
-            if winner_id:
-                await bot.send_message(winner_id, f"🎉 Вы выиграли {prizes[i]}! Напишите админу.")
 
-    await notify_all_users(f"🏁 Конкурс завершился! Победители: {winners_text}")
+    await notify_all_users(f"🏁 Конкурс завершился! Победители: {winners_text if winners else 'Нет'}")
 
     await send_admin_log()
 
@@ -939,3 +888,4 @@ if __name__ == "__main__":
         print("Остановка бота")
     finally:
         asyncio.run(bot.session.close())
+``` contest_kb
