@@ -729,7 +729,9 @@ async def toggle_winner(callback: types.CallbackQuery, state: FSMContext):
         selected_json = json.dumps(selected)
         cur.execute("UPDATE contest SET selected_winners = ? WHERE id = 1", (selected_json,))
         conn.commit()
-        await callback.message.answer(f"Победители выбраны: {', '.join(['@' + u for u in selected])}")
+        winners_text = ', '.join(['@' + u for u in selected])
+        await callback.message.answer(f"Победители выбраны: {winners_text}")
+        await bot.send_message(ADMIN_ID, f"Победители выбраны: {winners_text}")
         await state.clear()
 
 @dp.callback_query(lambda c: c.data == "admin_view_balances")
