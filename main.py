@@ -66,7 +66,7 @@ CREATE TABLE IF NOT EXISTS users (
     user_id INTEGER PRIMARY KEY,
     username TEXT,
     aur_balance INTEGER DEFAULT 0,
-    ton_balance INTEGER DEFAULT 0,
+    ton_balance REAL DEFAULT 0.0,
     tickets INTEGER DEFAULT 0,
     referrer_id INTEGER,
     rewarded_referrer INTEGER DEFAULT 0
@@ -81,11 +81,11 @@ CREATE TABLE IF NOT EXISTS contest (
     end_time TEXT,
     duration_minutes INTEGER DEFAULT 10,
     cost_per_ticket_aur INTEGER DEFAULT 10000,
-    cost_per_ticket_ton INTEGER DEFAULT 1,
+    cost_per_ticket_ton REAL DEFAULT 1.0,
     prize_message_ids TEXT DEFAULT '[]'  -- JSON список message_id для призов
 )
 """)
-cur.execute("INSERT OR IGNORE INTO contest (id, is_active, duration_minutes, cost_per_ticket_aur, cost_per_ticket_ton) VALUES (1, 0, 10, 10000, 1)")
+cur.execute("INSERT OR IGNORE INTO contest (id, is_active, duration_minutes, cost_per_ticket_aur, cost_per_ticket_ton) VALUES (1, 0, 10, 10000, 1.0)")
 
 conn.commit()
 
@@ -148,6 +148,11 @@ def user_kb():
         [InlineKeyboardButton(text="📊 Баланс", callback_data="balance")],
         [InlineKeyboardButton(text="🤝 Реф. ссылка", callback_data="ref")],
         [InlineKeyboardButton(text="📈 Статистика шансов", callback_data="stats")],
+        [InlineKeyboardButton(text="🔗 Buy AUR & links", callback_data="buy_aur_links")],
+    ])
+
+def links_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔗 Купить AUR в Blum", url="https://t.me/blum/app?startapp=memepadjetton_AUR_7r9oz-ref_opfXL31Vvi")],
         [InlineKeyboardButton(text="🔗 Купить AUR в Ston.fi", url="https://app.ston.fi/swap?ft=TON&tt=EQDtrpq6zmwzfqFL9JWnXzjZoZhK9xaprFCXerxPS4ZbS5tl&chartVisible=false&chartInterval=1w")],
         [InlineKeyboardButton(text="🔗 Купить AUR в DTrade", url="https://t.me/dtrade?start=12z09jrKRK_EQDtrpq6zmwzfqFL9JWnXzjZoZhK9xaprFCXerxPS4ZbS5tl")],
@@ -431,7 +436,7 @@ async def process_buy_tickets(message: types.Message, state: FSMContext):
         cur.execute("SELECT ton_balance, referrer_id, rewarded_referrer FROM users WHERE user_id = ?", (uid,))
         row = cur.fetchone()
         balance = row[0]
-        referrer_id, rewarded = row[1], row[2]
+    referrer_id, rewarded = row[1], row[2]
 
     if balance < cost:
         await message.answer(f"Недостаточно средств. Требуется {cost} {currency}, доступно {balance} {currency}")
@@ -449,7 +454,6 @@ async def process_buy_tickets(message: types.Message, state: FSMContext):
             (cost, quantity, uid)
         )
 
-    referrer_id, rewarded = row[1], row[2]
     if referrer_id and rewarded == 0:
         cur.execute("UPDATE users SET tickets = tickets + 1 WHERE user_id = ?", (referrer_id,))
         cur.execute("UPDATE users SET rewarded_referrer = 1 WHERE user_id = ?", (uid,))
@@ -533,6 +537,11 @@ async def stats(callback: types.CallbackQuery):
     text += f"\nВсего билетов: {total_tickets}"
 
     await callback.message.answer(text)
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data == "buy_aur_links")
+async def show_links(callback: types.CallbackQuery):
+    await callback.message.answer("Ссылки для покупки AUR и сообщества:", reply_markup=links_kb())
     await callback.answer()
 
 @dp.message(Command("send"))
@@ -761,11 +770,15 @@ async def admin_set_cost_ton(callback: types.CallbackQuery, state: FSMContext):
 
 @dp.message(SetCostTonState.waiting_cost)
 async def process_cost_ton(message: types.Message, state: FSMContext):
-    if not message.text.isdigit() or int(message.text) <= 0:
-        await message.answer("Введите положительное целое число")
+    try:
+        cost = float(message.text)
+        if cost <= 0:
+            await message.answer("Введите положительное число")
+            return
+    except ValueError:
+        await message.answer("Введите число (можно дробное, например 0.1)")
         return
 
-    cost = int(message.text)
     cur.execute("UPDATE contest SET cost_per_ticket_ton = ? WHERE id = 1", (cost,))
     conn.commit()
     await message.answer(f"Стоимость билета в TON установлена: {cost} TON")
@@ -980,3 +993,4 @@ if __name__ == "__main__":
         print("Остановка бота")
     finally:
         asyncio.run(bot.session.close())
+```@dp
