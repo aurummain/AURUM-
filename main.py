@@ -3,7 +3,7 @@ import os
 import sqlite3
 import random
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import aiohttp
 from aiohttp import web
@@ -95,7 +95,7 @@ five_min_notified = False
 # ──────────────────── Антиспам функция ────────────────────
 
 async def check_rate_limit_and_ban(user_id: int, command: str):
-    now = datetime.utcnow().timestamp()
+    now = datetime.now(timezone.utc).timestamp()
     if user_id not in rate_limit_dict:
         rate_limit_dict[user_id] = {}
 
@@ -127,7 +127,7 @@ async def check_rate_limit_and_ban(user_id: int, command: str):
     return False
 
 async def unban_user(user_id: int, unban_time: float):
-    await asyncio.sleep(unban_time - datetime.utcnow().timestamp())
+    await asyncio.sleep(unban_time - datetime.now(timezone.utc).timestamp())
     if user_id in ban_dict:
         del ban_dict[user_id]
     try:
@@ -228,7 +228,7 @@ async def cmd_start(message: types.Message):
     else:
         if is_active and end_time:
             try:
-                remaining = datetime.fromisoformat(end_time) - datetime.utcnow()
+                remaining = datetime.fromisoformat(end_time) - datetime.now(timezone.utc)
                 if remaining.total_seconds() > 0:
                     m, s = divmod(int(remaining.total_seconds()), 60)
                     cur.execute("SELECT SUM(tickets) FROM users")
@@ -571,7 +571,7 @@ async def admin_start(callback: types.CallbackQuery):
     prizes_text = ", ".join(prizes) if prizes else "Приз не установлен"
     duration_minutes = row[1]
 
-    end_time = (datetime.utcnow() + timedelta(minutes=duration_minutes)).isoformat()
+    end_time = (datetime.now(timezone.utc) + timedelta(minutes=duration_minutes)).isoformat()
 
     cur.execute("UPDATE contest SET is_active = 1, end_time = ?, selected_winners = '[]', prize_message_ids = '[]' WHERE id = 1", (end_time,))
     conn.commit()
@@ -781,7 +781,7 @@ async def update_timer():
             break
 
         end_time = datetime.fromisoformat(row[1])
-        remaining = end_time - datetime.utcnow()
+        remaining = end_time - datetime.now(timezone.utc)
 
         cur.execute("SELECT SUM(tickets) FROM users")
         total_tickets = cur.fetchone()[0] or 0
@@ -823,7 +823,7 @@ async def perform_draw(total_tickets):
     if selected:
         winners = selected[:num_prizes]
     else:
-        winners = []  # Нет автоматического выбора, только ручной
+        winners = []  # Нет автоматического выбора
 
     winners_text = ", ".join([f"@{w}" for w in winners]) if winners else "Нет победителей"
     text = f"🎉 Конкурс завершён!\nПобедители: {winners_text}\nПоздравляем!"
