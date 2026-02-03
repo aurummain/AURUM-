@@ -22,14 +22,16 @@ TON_WALLET = "UQBJNtgVfE-x7-K1uY_EhW1rdvGKhq5gM244fX89VF0bof7R"
 DEFAULT_COST_PER_TICKET = 10000
 DEFAULT_CONTEST_MINUTES = 10
 TIMER_UPDATE_INTERVAL = 15
-RATE_LIMIT_SECONDS = 5  # Антиспам: мин. интервал между командами
-BAN_DURATION_MINUTES = 5  # Длительность блока при спаме
+RATE_LIMIT_WINDOW = 60  # Окно в секундах (1 минута)
+RATE_LIMIT_COUNT = 5  # Макс команд за окно
+BAN_DURATION_MINUTES = 5  # Длительность блока
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# Глобальный словарь для rate limit (user_id: last_time)
-rate_limit_dict = {}
+# Глобальные словари для rate limit и банов
+rate_limit_dict = {}  # user_id: {command: [timestamps]}
+ban_dict = {}  # user_id: unban_time
 
 # ──────────────────── FSM ────────────────────
 
@@ -63,8 +65,7 @@ CREATE TABLE IF NOT EXISTS users (
     balance INTEGER DEFAULT 0,
     tickets INTEGER DEFAULT 0,
     referrer_id INTEGER,
-    rewarded_referrer INTEGER DEFAULT 0,
-    banned_until TEXT DEFAULT NULL
+    rewarded_referrer INTEGER DEFAULT 0
 )
 """)
 
@@ -88,28 +89,50 @@ conn.commit()
 announce_chat_id: int | None = None
 announce_message_id: int | None = None
 timer_task: asyncio.Task | None = None
-five_min_notified = False  # Флаг для уведомления "осталось 5 мин"
+five_min_notified = False
 
 # ──────────────────── Антиспам функция ────────────────────
 
-async def check_rate_limit_and_ban(user_id: int):
+async def check_rate_limit_and_ban(user_id: int, command: str):
     now = datetime.utcnow().timestamp()
-    last_time = rate_limit_dict.get(user_id, 0)
-    if now - last_time < RATE_LIMIT_SECONDS:
-        # Спам: Блок на BAN_DURATION_MINUTES
-        ban_until = (datetime.utcnow() + timedelta(minutes=BAN_DURATION_MINUTES)).isoformat()
-        cur.execute("UPDATE users SET banned_until = ? WHERE user_id = ?", (ban_until, user_id))
-        conn.commit()
+    if user_id not in rate_limit_dict:
+        rate_limit_dict[user_id] = {}
+
+    if command not in rate_limit_dict[user_id]:
+        rate_limit_dict[user_id][command] = []
+
+    # Очистка старых timestamps
+    rate_limit_dict[user_id][command] = [t for t in rate_limit_dict[user_id][command] if now - t < RATE_LIMIT_WINDOW]
+
+    # Проверка бана
+    if user_id in ban_dict and now < ban_dict[user_id]:
         return True  # Заблокирован
-    rate_limit_dict[user_id] = now
-    # Проверить текущий бан
-    cur.execute("SELECT banned_until FROM users WHERE user_id = ?", (user_id,))
-    row = cur.fetchone()
-    if row and row[0]:
-        ban_time = datetime.fromisoformat(row[0]).timestamp()
-        if now < ban_time:
-            return True  # Ещё заблокирован
-    return False  # OK
+
+    # Счётчик
+    if len(rate_limit_dict[user_id][command]) >= RATE_LIMIT_COUNT:
+        # Бан
+        unban_time = now + (BAN_DURATION_MINUTES * 60)
+        ban_dict[user_id] = unban_time
+        try:
+            await bot.send_message(user_id, f"Вы заблокированы за спам на {BAN_DURATION_MINUTES} минут!")
+        except:
+            pass
+        # Запуск задачи на разблок
+        asyncio.create_task(unban_user(user_id, unban_time))
+        return True
+
+    # Добавить timestamp
+    rate_limit_dict[user_id][command].append(now)
+    return False
+
+async def unban_user(user_id: int, unban_time: float):
+    await asyncio.sleep(unban_time - datetime.utcnow().timestamp())
+    if user_id in ban_dict:
+        del ban_dict[user_id]
+    try:
+        await bot.send_message(user_id, "Вы разблокированы!")
+    except:
+        pass
 
 # ──────────────────── КЛАВИАТУРЫ ────────────────────
 
@@ -148,7 +171,6 @@ def confirm_topup_kb(user_id: int, amount: int):
         [InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_{user_id}_{amount}")]
     ])
 
-# Клавиатура для выбора победителей (динамическая)
 def get_select_winners_kb(participants, selected):
     kb = []
     for username in participants:
@@ -162,7 +184,7 @@ def get_select_winners_kb(participants, selected):
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
-    if await check_rate_limit_and_ban(message.from_user.id):
+    if await check_rate_limit_and_ban(message.from_user.id, "start"):
         await message.answer("Вы заблокированы за спам. Подождите.")
         return
 
@@ -179,14 +201,12 @@ async def cmd_start(message: types.Message):
             (user.id, user.username, referrer_id)
         )
         conn.commit()
-        # Уведомление только при новой регистрации
         if referrer_id:
             try:
                 await bot.send_message(referrer_id, f"У вас новый реферал: @{user.username or f'ID{user.id}'}")
             except Exception as e:
                 print(f"Ошибка уведомления реферера: {e}")
     elif referrer_id and existing[0] != referrer_id:
-        # Не перезаписывать referrer_id
         pass
 
     cur.execute("SELECT is_active, prizes, end_time FROM contest WHERE id = 1")
@@ -241,7 +261,7 @@ async def cb_topup(callback: types.CallbackQuery, state: FSMContext):
     if callback.message.chat.type != "private":
         await callback.answer("Только в ЛС", show_alert=True)
         return
-    if await check_rate_limit_and_ban(callback.from_user.id):
+    if await check_rate_limit_and_ban(callback.from_user.id, "topup"):
         await callback.answer("Вы заблокированы за спам.", show_alert=True)
         return
     await callback.message.answer("Введите сумму пополнения:")
@@ -250,7 +270,7 @@ async def cb_topup(callback: types.CallbackQuery, state: FSMContext):
 
 @dp.message(TopUpState.waiting_amount)
 async def process_topup(message: types.Message, state: FSMContext):
-    if await check_rate_limit_and_ban(message.from_user.id):
+    if await check_rate_limit_and_ban(message.from_user.id, "topup"):
         return
 
     if not message.text.isdigit():
@@ -322,7 +342,7 @@ async def start_buy_tickets(callback: types.CallbackQuery, state: FSMContext):
     if callback.message.chat.type != "private":
         await callback.answer("Только в ЛС", show_alert=True)
         return
-    if await check_rate_limit_and_ban(callback.from_user.id):
+    if await check_rate_limit_and_ban(callback.from_user.id, "buy"):
         await callback.answer("Вы заблокированы за спам.", show_alert=True)
         return
     uid = callback.from_user.id
@@ -339,7 +359,7 @@ async def start_buy_tickets(callback: types.CallbackQuery, state: FSMContext):
 
 @dp.message(BuyTicketsState.waiting_quantity)
 async def process_buy_tickets(message: types.Message, state: FSMContext):
-    if await check_rate_limit_and_ban(message.from_user.id):
+    if await check_rate_limit_and_ban(message.from_user.id, "buy"):
         return
 
     if not message.text.isdigit() or int(message.text) <= 0:
@@ -358,19 +378,16 @@ async def process_buy_tickets(message: types.Message, state: FSMContext):
         await state.clear()
         return
 
-    # Обновление баланса и билетов покупателя
     cur.execute(
         "UPDATE users SET balance = balance - ?, tickets = tickets + ? WHERE user_id = ?",
         (cost, quantity, uid)
     )
 
-    # Начисление реферального билета, если это первая покупка и есть реферер
     referrer_id, rewarded = row[1], row[2]
     if referrer_id and rewarded == 0:
         cur.execute("UPDATE users SET tickets = tickets + 1 WHERE user_id = ?", (referrer_id,))
         cur.execute("UPDATE users SET rewarded_referrer = 1 WHERE user_id = ?", (uid,))
         
-        # Уведомление рефереру (только один раз)
         buyer_username = message.from_user.username or f"ID{uid}"
         try:
             await bot.send_message(referrer_id, f"Ваш реферал @{buyer_username} купил билет — вы получили 1 билет!")
@@ -396,7 +413,7 @@ async def process_buy_tickets(message: types.Message, state: FSMContext):
 
 @dp.callback_query(lambda c: c.data == "balance")
 async def balance(callback: types.CallbackQuery):
-    if await check_rate_limit_and_ban(callback.from_user.id):
+    if await check_rate_limit_and_ban(callback.from_user.id, "balance"):
         await callback.answer("Вы заблокированы за спам.", show_alert=True)
         return
     cur.execute("SELECT balance, tickets FROM users WHERE user_id = ?", (callback.from_user.id,))
@@ -412,7 +429,7 @@ async def balance(callback: types.CallbackQuery):
 
 @dp.callback_query(lambda c: c.data == "ref")
 async def ref(callback: types.CallbackQuery):
-    if await check_rate_limit_and_ban(callback.from_user.id):
+    if await check_rate_limit_and_ban(callback.from_user.id, "ref"):
         await callback.answer("Вы заблокированы за спам.", show_alert=True)
         return
     me = await bot.get_me()
@@ -423,7 +440,7 @@ async def ref(callback: types.CallbackQuery):
 
 @dp.callback_query(lambda c: c.data == "stats")
 async def stats(callback: types.CallbackQuery):
-    if await check_rate_limit_and_ban(callback.from_user.id):
+    if await check_rate_limit_and_ban(callback.from_user.id, "stats"):
         await callback.answer("Вы заблокированы за спам.", show_alert=True)
         return
     cur.execute("SELECT is_active FROM contest WHERE id = 1")
@@ -432,7 +449,7 @@ async def stats(callback: types.CallbackQuery):
         await callback.answer("Нет активного конкурса", show_alert=True)
         return
 
-    cur.execute("SELECT username, tickets FROM users WHERE tickets > 0 ORDER BY tickets DESC")
+    cur.execute("SELECT username, tickets FROM users WHERE tickets > 0 AND username IS NOT NULL ORDER BY tickets DESC")
     rows = cur.fetchall()
     cur.execute("SELECT SUM(tickets) FROM users")
     total_tickets = cur.fetchone()[0] or 0
@@ -444,9 +461,8 @@ async def stats(callback: types.CallbackQuery):
 
     text = "📈 Статистика шансов на победу:\n"
     for username, tickets in rows:
-        if username:
-            prob = (tickets / total_tickets) * 100
-            text += f"@{username}: {tickets} билетов ({prob:.2f}%)\n"
+        prob = (tickets / total_tickets) * 100
+        text += f"@{username}: {tickets} билетов ({prob:.2f}%)\n"
 
     text += f"\nВсего билетов: {total_tickets}"
 
@@ -455,7 +471,7 @@ async def stats(callback: types.CallbackQuery):
 
 @dp.message(Command("send"))
 async def cmd_send(message: types.Message):
-    if await check_rate_limit_and_ban(message.from_user.id):
+    if await check_rate_limit_and_ban(message.from_user.id, "send"):
         return
     sender_id = message.from_user.id
     cur.execute("SELECT tickets FROM users WHERE user_id = ?", (sender_id,))
@@ -565,7 +581,6 @@ async def admin_start(callback: types.CallbackQuery):
     five_min_notified = False
     timer_task = asyncio.create_task(update_timer())
 
-    # Рассылка уведомления "Конкурс начался" всем пользователям
     await notify_all_users("🎉 Конкурс начался! Участвуйте и покупайте билеты.")
 
     await callback.message.answer("Конкурс запущен!")
@@ -786,9 +801,8 @@ async def perform_draw(total_tickets):
     num_prizes = len(prizes)
 
     if selected:
-        winners = selected[:num_prizes]  # Берем выбранных, до кол-ва призов
+        winners = selected[:num_prizes]
     else:
-        # Авто-выбор, если не выбраны
         if total_tickets == 0:
             text = "Конкурс завершён. Никто не купил билеты."
             winners = []
@@ -808,14 +822,16 @@ async def perform_draw(total_tickets):
             winners = []
             for wid in winners_ids:
                 cur.execute("SELECT username FROM users WHERE user_id = ?", (wid,))
-                winners.append(cur.fetchone()[0] or f"ID{wid}")
+                w_username = cur.fetchone()[0]
+                if w_username:
+                    winners.append(w_username)
 
     if winners:
         winners_text = ", ".join([f"@{w}" for w in winners])
         text = f"🎉 Конкурс завершён!\nПобедители: {winners_text}\nПоздравляем!"
         for i, winner in enumerate(winners):
             prize = prizes[i] if i < len(prizes) else "Дополнительный приз"
-            winner_id = await get_user_id_by_username(winner)  # Функция для получения ID по username
+            winner_id = await get_user_id_by_username(winner)
             if winner_id:
                 await bot.send_message(winner_id, f"🎉 Вы выиграли {prize}! Напишите админу.")
         await bot.send_message(ADMIN_ID, f"Победители: {winners_text}")
@@ -828,10 +844,8 @@ async def perform_draw(total_tickets):
         message_id=announce_message_id
     )
 
-    # Рассылка уведомления "Конкурс завершился"
     await notify_all_users(f"🏁 Конкурс завершился! Победители: {winners_text if winners else 'Нет'}")
 
-    # Лог админу
     await send_admin_log()
 
     cur.execute("UPDATE contest SET is_active = 0, end_time = NULL WHERE id = 1")
@@ -854,16 +868,15 @@ async def notify_all_users(text):
             print(f"Ошибка рассылки: {e}")
 
 async def send_admin_log():
-    cur.execute("SELECT username, tickets FROM users WHERE tickets > 0")
+    cur.execute("SELECT username, tickets FROM users WHERE tickets > 0 AND username IS NOT NULL")
     participants = cur.fetchall()
     num_participants = len(participants)
-    total_tickets = sum([p[1] for p in participants])
+    total_tickets = sum([p[1] for p in participants]) if participants else 0
 
     text = f"Лог конкурса:\nУчастников: {num_participants}\nВсего билетов: {total_tickets}\n"
     for username, tickets in participants:
-        if username:
-            prob = (tickets / total_tickets * 100) if total_tickets > 0 else 0
-            text += f"@{username}: {tickets} билетов ({prob:.2f}%)\n"
+        prob = (tickets / total_tickets * 100) if total_tickets > 0 else 0
+        text += f"@{username}: {tickets} билетов ({prob:.2f}%)\n"
 
     await bot.send_message(ADMIN_ID, text)
 
@@ -883,7 +896,7 @@ async def keep_alive():
                     print(f"Keep-alive ping → {resp.status}")
             except Exception as e:
                 print(f"Keep-alive ошибка: {e}")
-            await asyncio.sleep(240)  # каждые 4 минуты
+            await asyncio.sleep(240)
 
 # ──────────────────── FAKE WEB SERVER ────────────────────
 
