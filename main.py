@@ -19,7 +19,8 @@ BOT_TOKEN = "8323563478:AAE9qcdBfdvO1ptKkCXS78hJ4SuxeFOnV2w"
 ADMIN_ID = 1333099097
 TON_WALLET = "UQBJNtgVfE-x7-K1uY_EhW1rdvGKhq5gM244fX89VF0bof7R"
 
-DEFAULT_COST_PER_TICKET = 10000
+DEFAULT_AUR_COST = 10000
+DEFAULT_TON_COST = 0.5
 DEFAULT_CONTEST_MINUTES = 10
 TIMER_UPDATE_INTERVAL = 15
 RATE_LIMIT_WINDOW = 60  # Окно в секундах (1 минута)
@@ -42,13 +43,14 @@ class SetPrizesState(StatesGroup):
     waiting_prizes = State()
 
 class BuyTicketsState(StatesGroup):
+    waiting_currency = State()
     waiting_quantity = State()
 
 class SetDurationState(StatesGroup):
     waiting_duration = State()
 
-class SetCostState(StatesGroup):
-    waiting_cost = State()
+class SetPricesState(StatesGroup):
+    waiting_prices = State()
 
 # ──────────────────── БАЗА ДАННЫХ ────────────────────
 
@@ -73,12 +75,12 @@ CREATE TABLE IF NOT EXISTS contest (
     is_active INTEGER DEFAULT 0,
     end_time TEXT,
     duration_minutes INTEGER DEFAULT 10,
-    cost_per_ticket INTEGER DEFAULT 10000,
-    selected_winners TEXT DEFAULT '[]',  -- JSON список выбранных победителей
+    aur_cost_per_ticket INTEGER DEFAULT 10000,
+    ton_cost_per_ticket REAL DEFAULT 0.5,
     prize_message_ids TEXT DEFAULT '[]'  -- JSON список message_id для призов
 )
 """)
-cur.execute("INSERT OR IGNORE INTO contest (id, is_active, duration_minutes, cost_per_ticket) VALUES (1, 0, 10, 10000)")
+cur.execute("INSERT OR IGNORE INTO contest (id, is_active, duration_minutes, aur_cost_per_ticket, ton_cost_per_ticket) VALUES (1, 0, 10, 10000, 0.5)")
 
 conn.commit()
 
@@ -154,7 +156,7 @@ def admin_kb():
         [InlineKeyboardButton(text="⏹ Остановить конкурс", callback_data="admin_stop")],
         [InlineKeyboardButton(text="🏆 Установить призы", callback_data="set_prizes")],
         [InlineKeyboardButton(text="⏰ Установить время раунда", callback_data="set_duration")],
-        [InlineKeyboardButton(text="💰 Установить стоимость билета", callback_data="set_cost")],
+        [InlineKeyboardButton(text="💰 Установить цены (AUR/TON)", callback_data="set_prices")],
         [InlineKeyboardButton(text="👥 Балансы игроков", callback_data="admin_view_balances")],
     ])
 
@@ -167,10 +169,10 @@ async def contest_kb():
         )],
     ])
 
-def confirm_topup_kb(user_id: int, amount: int):
+def confirm_topup_kb(user_id: int, amount: int, currency: str = "AUR"):
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"✅ Подтвердить {amount}", callback_data=f"confirm_{user_id}_{amount}")],
-        [InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_{user_id}_{amount}")]
+        [InlineKeyboardButton(text=f"✅ Подтвердить {amount} {currency}", callback_data=f"confirm_{user_id}_{amount}_{currency}")],
+        [InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_{user_id}_{amount}_{currency}")]
     ])
 
 # ──────────────────── HANDLERS ────────────────────
@@ -654,26 +656,33 @@ async def process_duration(message: types.Message, state: FSMContext):
     await message.answer(f"Продолжительность раунда установлена: {duration} минут")
     await state.clear()
 
-@dp.callback_query(lambda c: c.data == "set_cost")
-async def admin_set_cost(callback: types.CallbackQuery, state: FSMContext):
+@dp.callback_query(lambda c: c.data == "set_prices")
+async def admin_set_prices(callback: types.CallbackQuery, state: FSMContext):
     if callback.from_user.id != ADMIN_ID:
         await callback.answer("Нет доступа", show_alert=True)
         return
 
-    await callback.message.answer("Введите стоимость одного билета в AUR:")
-    await state.set_state(SetCostState.waiting_cost)
+    await callback.message.answer("Введите цены через пробел: AUR:10000 TON:0.5")
+    await state.set_state(SetPricesState.waiting_prices)
     await callback.answer()
 
-@dp.message(SetCostState.waiting_cost)
-async def process_cost(message: types.Message, state: FSMContext):
-    if not message.text.isdigit() or int(message.text) <= 0:
-        await message.answer("Введите положительное целое число")
-        return
+@dp.message(SetPricesState.waiting_prices)
+async def process_prices(message: types.Message, state: FSMContext):
+    parts = message.text.split()
+    aur_cost = None
+    ton_cost = None
+    for p in parts:
+        if p.startswith("AUR:"):
+            aur_cost = int(p.split(":")[1])
+        elif p.startswith("TON:"):
+            ton_cost = float(p.split(":")[1])
 
-    cost = int(message.text)
-    cur.execute("UPDATE contest SET cost_per_ticket = ? WHERE id = 1", (cost,))
-    conn.commit()
-    await message.answer(f"Стоимость билета установлена: {cost} AUR")
+    if aur_cost is not None and ton_cost is not None:
+        cur.execute("UPDATE contest SET aur_cost_per_ticket = ?, ton_cost_per_ticket = ? WHERE id = 1", (aur_cost, ton_cost))
+        conn.commit()
+        await message.answer(f"Цены установлены: AUR {aur_cost}, TON {ton_cost}")
+    else:
+        await message.answer("Неверный формат.")
     await state.clear()
 
 @dp.callback_query(lambda c: c.data == "admin_view_balances")
@@ -737,16 +746,14 @@ async def update_timer():
             print(f"Ошибка редактирования таймера: {e}")
 
 async def perform_draw(total_tickets):
-    cur.execute("SELECT selected_winners, prizes, prize_message_ids FROM contest WHERE id = 1")
+    cur.execute("SELECT prizes, prize_message_ids FROM contest WHERE id = 1")
     row = cur.fetchone()
-    selected_json = row[0] or '[]'
-    selected = json.loads(selected_json)
-    prizes = json.loads(row[1] or '[]')
-    prize_message_ids = json.loads(row[2] or '[]')
+    prizes = json.loads(row[0] or '[]')
+    prize_message_ids = json.loads(row[1] or '[]')
     num_prizes = len(prizes)
 
     if total_tickets == 0:
-        text = "Конкурс завершён. Никто не купил билеты."
+        text = "Конкурс завершён. Никто не купил билетов."
         winners = []
     else:
         cur.execute("SELECT user_id, tickets FROM users WHERE tickets > 0")
@@ -768,17 +775,8 @@ async def perform_draw(total_tickets):
             if w_username:
                 winners.append(w_username)
 
-    if winners:
-        winners_text = ", ".join([f"@{w}" for w in winners])
-        text = f"🎉 Конкурс завершён!\nПобедители: {winners_text}\nПоздравляем!"
-        for i, winner in enumerate(winners):
-            prize = prizes[i] if i < len(prizes) else "Дополнительный приз"
-            winner_id = await get_user_id_by_username(winner)
-            if winner_id:
-                await bot.send_message(winner_id, f"🎉 Вы выиграли {prize}! Напишите админу.")
-        await bot.send_message(ADMIN_ID, f"Победители: {winners_text}")
-    else:
-        text = "Конкурс завершён. Нет победителей."
+    winners_text = ", ".join([f"@{w}" for w in winners]) if winners else "Нет победителей"
+    text = f"🎉 Конкурс завершён!\nПобедители: {winners_text}\nПоздравляем!"
 
     await bot.edit_message_text(
         text,
@@ -793,8 +791,11 @@ async def perform_draw(total_tickets):
             winner_tickets, winner_prob = await get_winner_stats(winner, total_tickets)
             edit_text = f"{i+1}й приз: {prizes[i]} победил @{winner} ({winner_tickets} билетов, {winner_prob:.2f}%)"
             await bot.edit_message_text(edit_text, chat_id=announce_chat_id, message_id=mid)
+            winner_id = await get_user_id_by_username(winner)
+            if winner_id:
+                await bot.send_message(winner_id, f"🎉 Вы выиграли {prizes[i]}! Напишите админу.")
 
-    await notify_all_users(f"🏁 Конкурс завершился! Победители: {winners_text if winners else 'Нет'}")
+    await notify_all_users(f"🏁 Конкурс завершился! Победители: {winners_text}")
 
     await send_admin_log()
 
@@ -888,4 +889,3 @@ if __name__ == "__main__":
         print("Остановка бота")
     finally:
         asyncio.run(bot.session.close())
-``` contest_kb
