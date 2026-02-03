@@ -19,8 +19,7 @@ BOT_TOKEN = "8323563478:AAE9qcdBfdvO1ptKkCXS78hJ4SuxeFOnV2w"
 ADMIN_ID = 1333099097
 TON_WALLET = "UQBJNtgVfE-x7-K1uY_EhW1rdvGKhq5gM244fX89VF0bof7R"
 
-DEFAULT_AUR_COST = 10000
-DEFAULT_TON_COST = 0.5
+DEFAULT_COST_PER_TICKET = 10000
 DEFAULT_CONTEST_MINUTES = 10
 TIMER_UPDATE_INTERVAL = 15
 RATE_LIMIT_WINDOW = 60  # Окно в секундах (1 минута)
@@ -37,20 +36,20 @@ ban_dict = {}  # user_id: unban_time
 # ──────────────────── FSM ────────────────────
 
 class TopUpState(StatesGroup):
+    waiting_currency = State()
     waiting_amount = State()
 
 class SetPrizesState(StatesGroup):
     waiting_prizes = State()
 
 class BuyTicketsState(StatesGroup):
-    waiting_currency = State()
     waiting_quantity = State()
 
 class SetDurationState(StatesGroup):
     waiting_duration = State()
 
-class SetPricesState(StatesGroup):
-    waiting_prices = State()
+class SetCostState(StatesGroup):
+    waiting_cost = State()
 
 # ──────────────────── БАЗА ДАННЫХ ────────────────────
 
@@ -75,12 +74,11 @@ CREATE TABLE IF NOT EXISTS contest (
     is_active INTEGER DEFAULT 0,
     end_time TEXT,
     duration_minutes INTEGER DEFAULT 10,
-    aur_cost_per_ticket INTEGER DEFAULT 10000,
-    ton_cost_per_ticket REAL DEFAULT 0.5,
+    cost_per_ticket INTEGER DEFAULT 10000,
     prize_message_ids TEXT DEFAULT '[]'  -- JSON список message_id для призов
 )
 """)
-cur.execute("INSERT OR IGNORE INTO contest (id, is_active, duration_minutes, aur_cost_per_ticket, ton_cost_per_ticket) VALUES (1, 0, 10, 10000, 0.5)")
+cur.execute("INSERT OR IGNORE INTO contest (id, is_active, duration_minutes, cost_per_ticket) VALUES (1, 0, 10, 10000)")
 
 conn.commit()
 
@@ -156,7 +154,7 @@ def admin_kb():
         [InlineKeyboardButton(text="⏹ Остановить конкурс", callback_data="admin_stop")],
         [InlineKeyboardButton(text="🏆 Установить призы", callback_data="set_prizes")],
         [InlineKeyboardButton(text="⏰ Установить время раунда", callback_data="set_duration")],
-        [InlineKeyboardButton(text="💰 Установить цены (AUR/TON)", callback_data="set_prices")],
+        [InlineKeyboardButton(text="💰 Установить стоимость билета", callback_data="set_cost")],
         [InlineKeyboardButton(text="👥 Балансы игроков", callback_data="admin_view_balances")],
     ])
 
@@ -169,10 +167,10 @@ async def contest_kb():
         )],
     ])
 
-def confirm_topup_kb(user_id: int, amount: int, currency: str = "AUR"):
+def confirm_topup_kb(user_id: int, amount: int):
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"✅ Подтвердить {amount} {currency}", callback_data=f"confirm_{user_id}_{amount}_{currency}")],
-        [InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_{user_id}_{amount}_{currency}")]
+        [InlineKeyboardButton(text=f"✅ Подтвердить {amount}", callback_data=f"confirm_{user_id}_{amount}")],
+        [InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_{user_id}_{amount}")]
     ])
 
 # ──────────────────── HANDLERS ────────────────────
@@ -259,14 +257,29 @@ async def cb_topup(callback: types.CallbackQuery, state: FSMContext):
     if await check_rate_limit_and_ban(callback.from_user.id, "topup"):
         await callback.answer("Вы заблокированы за спам.", show_alert=True)
         return
-    await callback.message.answer("Введите сумму пополнения:")
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💎 AUR", callback_data="topup_aur")],
+        [InlineKeyboardButton(text="🔵 TON", callback_data="topup_ton")],
+    ])
+    await callback.message.answer("Выберите валюту для пополнения:", reply_markup=kb)
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data.startswith("topup_"))
+async def process_topup_currency(callback: types.CallbackQuery, state: FSMContext):
+    currency = callback.data.split("_")[1].upper()
+    await state.update_data(currency=currency)
+    await callback.message.answer(f"Введите сумму пополнения в {currency}:")
     await state.set_state(TopUpState.waiting_amount)
     await callback.answer()
 
 @dp.message(TopUpState.waiting_amount)
-async def process_topup(message: types.Message, state: FSMContext):
+async def process_topup_amount(message: types.Message, state: FSMContext):
     if await check_rate_limit_and_ban(message.from_user.id, "topup"):
         return
+
+    data = await state.get_data()
+    currency = data.get("currency", "AUR")
 
     if not message.text.isdigit():
         await message.answer("Введите число")
@@ -276,7 +289,7 @@ async def process_topup(message: types.Message, state: FSMContext):
     memo = f"{message.from_user.id}_{message.from_user.username or 'no_username'}"
 
     await message.answer(
-        f"💳 Пополнение на {amount} AUR\n"
+        f"💳 Пополнение на {amount} {currency}\n"
         f"Кошелёк: <code>{TON_WALLET}</code>\n"
         f"Memo: <code>{memo}</code>",
         parse_mode="HTML"
@@ -284,7 +297,7 @@ async def process_topup(message: types.Message, state: FSMContext):
 
     await bot.send_message(
         ADMIN_ID,
-        f"🟢 Запрос пополнения\nОт: {message.from_user.id}\nСумма: {amount}",
+        f"🟢 Запрос пополнения\nОт: {message.from_user.id}\nВалюта: {currency}\nСумма: {amount}",
         reply_markup=confirm_topup_kb(message.from_user.id, amount)
     )
 
@@ -562,7 +575,7 @@ async def admin_start(callback: types.CallbackQuery):
 
     end_time = (datetime.now(timezone.utc) + timedelta(minutes=duration_minutes)).isoformat()
 
-    cur.execute("UPDATE contest SET is_active = 1, end_time = ?, selected_winners = '[]', prize_message_ids = '[]' WHERE id = 1", (end_time,))
+    cur.execute("UPDATE contest SET is_active = 1, end_time = ?, prize_message_ids = '[]' WHERE id = 1", (end_time,))
     conn.commit()
 
     # Первое сообщение: анонс
@@ -656,33 +669,26 @@ async def process_duration(message: types.Message, state: FSMContext):
     await message.answer(f"Продолжительность раунда установлена: {duration} минут")
     await state.clear()
 
-@dp.callback_query(lambda c: c.data == "set_prices")
-async def admin_set_prices(callback: types.CallbackQuery, state: FSMContext):
+@dp.callback_query(lambda c: c.data == "set_cost")
+async def admin_set_cost(callback: types.CallbackQuery, state: FSMContext):
     if callback.from_user.id != ADMIN_ID:
         await callback.answer("Нет доступа", show_alert=True)
         return
 
-    await callback.message.answer("Введите цены через пробел: AUR:10000 TON:0.5")
-    await state.set_state(SetPricesState.waiting_prices)
+    await callback.message.answer("Введите стоимость одного билета в AUR:")
+    await state.set_state(SetCostState.waiting_cost)
     await callback.answer()
 
-@dp.message(SetPricesState.waiting_prices)
-async def process_prices(message: types.Message, state: FSMContext):
-    parts = message.text.split()
-    aur_cost = None
-    ton_cost = None
-    for p in parts:
-        if p.startswith("AUR:"):
-            aur_cost = int(p.split(":")[1])
-        elif p.startswith("TON:"):
-            ton_cost = float(p.split(":")[1])
+@dp.message(SetCostState.waiting_cost)
+async def process_cost(message: types.Message, state: FSMContext):
+    if not message.text.isdigit() or int(message.text) <= 0:
+        await message.answer("Введите положительное целое число")
+        return
 
-    if aur_cost is not None and ton_cost is not None:
-        cur.execute("UPDATE contest SET aur_cost_per_ticket = ?, ton_cost_per_ticket = ? WHERE id = 1", (aur_cost, ton_cost))
-        conn.commit()
-        await message.answer(f"Цены установлены: AUR {aur_cost}, TON {ton_cost}")
-    else:
-        await message.answer("Неверный формат.")
+    cost = int(message.text)
+    cur.execute("UPDATE contest SET cost_per_ticket = ? WHERE id = 1", (cost,))
+    conn.commit()
+    await message.answer(f"Стоимость билета установлена: {cost} AUR")
     await state.clear()
 
 @dp.callback_query(lambda c: c.data == "admin_view_balances")
@@ -803,6 +809,11 @@ async def perform_draw(total_tickets):
     cur.execute("UPDATE users SET tickets = 0")
     conn.commit()
     print("Розыгрыш завершён, билеты сброшены")
+
+async def get_user_id_by_username(username):
+    cur.execute("SELECT user_id FROM users WHERE username = ?", (username,))
+    row = cur.fetchone()
+    return row[0] if row else None
 
 async def get_winner_stats(username, total_tickets):
     cur.execute("SELECT tickets FROM users WHERE username = ?", (username,))
