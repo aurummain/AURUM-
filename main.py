@@ -144,6 +144,11 @@ def user_kb():
         [InlineKeyboardButton(text="📊 Баланс", callback_data="balance")],
         [InlineKeyboardButton(text="🤝 Реф. ссылка", callback_data="ref")],
         [InlineKeyboardButton(text="📈 Статистика шансов", callback_data="stats")],
+        [InlineKeyboardButton(text="🔗 Купить AUR в Blum", url="https://t.me/blum/app?startapp=memepadjetton_AUR_7r9oz-ref_opfXL31Vvi")],
+        [InlineKeyboardButton(text="🔗 Купить AUR в Ston.fi", url="https://app.ston.fi/swap?ft=TON&tt=EQDtrpq6zmwzfqFL9JWnXzjZoZhK9xaprFCXerxPS4ZbS5tl&chartVisible=false&chartInterval=1w")],
+        [InlineKeyboardButton(text="🔗 Купить AUR в DTrade", url="https://t.me/dtrade?start=12z09jrKRK_EQDtrpq6zmwzfqFL9JWnXzjZoZhK9xaprFCXerxPS4ZbS5tl")],
+        [InlineKeyboardButton(text="🔗 Tg Channel", url="https://t.me/Aurum_comunity")],
+        [InlineKeyboardButton(text="🔗 Tg Chat", url="https://t.me/+AcwLYvvcLsRkZDUy")],
     ])
 
 def admin_kb():
@@ -817,52 +822,11 @@ async def perform_draw(total_tickets):
 
     if selected:
         winners = selected[:num_prizes]
-        winners_text = ", ".join([f"@{w}" for w in winners])
-        text = f"🎉 Конкурс завершён!\nПобедители: {winners_text}\nПоздравляем!"
-        # Редактировать сообщения призов
-        for i, mid in enumerate(prize_message_ids):
-            if i < len(winners):
-                winner = winners[i]
-                winner_tickets, winner_prob = await get_winner_stats(winner, total_tickets)
-                edit_text = f"Победитель приза {prizes[i]}: @{winner} ({winner_tickets} билетов, {winner_prob:.2f}%)"
-                await bot.edit_message_text(edit_text, chat_id=announce_chat_id, message_id=mid)
     else:
-        # Автоматический выбор
-        if total_tickets == 0:
-            text = "Конкурс завершён. Никто не купил билеты."
-            winners = []
-        else:
-            cur.execute("SELECT user_id, tickets FROM users WHERE tickets > 0")
-            participants = cur.fetchall()
+        winners = []  # Нет автоматического выбора, только ручной
 
-            pool = []
-            for uid, count in participants:
-                pool.extend([uid] * count)
-
-            winners_ids = set()
-            while len(winners_ids) < min(num_prizes, len(set(pool))):
-                winner_id = random.choice(pool)
-                winners_ids.add(winner_id)
-
-            winners = []
-            for wid in winners_ids:
-                cur.execute("SELECT username FROM users WHERE user_id = ?", (wid,))
-                w_username = cur.fetchone()[0]
-                if w_username:
-                    winners.append(w_username)
-
-        if winners:
-            winners_text = ", ".join([f"@{w}" for w in winners])
-            text = f"🎉 Конкурс завершён!\nПобедители: {winners_text}\nПоздравляем!"
-            # Редактировать сообщения призов для автоматического
-            for i, mid in enumerate(prize_message_ids):
-                if i < len(winners):
-                    winner = winners[i]
-                    winner_tickets, winner_prob = await get_winner_stats(winner, total_tickets)
-                    edit_text = f"Победитель приза {prizes[i]}: @{winner} ({winner_tickets} билетов, {winner_prob:.2f}%)"
-                    await bot.edit_message_text(edit_text, chat_id=announce_chat_id, message_id=mid)
-        else:
-            text = "Конкурс завершён. Нет победителей."
+    winners_text = ", ".join([f"@{w}" for w in winners]) if winners else "Нет победителей"
+    text = f"🎉 Конкурс завершён!\nПобедители: {winners_text}\nПоздравляем!"
 
     await bot.edit_message_text(
         text,
@@ -870,7 +834,18 @@ async def perform_draw(total_tickets):
         message_id=announce_message_id
     )
 
-    await notify_all_users(f"🏁 Конкурс завершился! Победители: {winners_text if winners else 'Нет'}")
+    # Редактировать сообщения призов
+    for i, mid in enumerate(prize_message_ids):
+        if i < len(winners):
+            winner = winners[i]
+            winner_tickets, winner_prob = await get_winner_stats(winner, total_tickets)
+            edit_text = f"Победитель приза {prizes[i]}: @{winner} ({winner_tickets} билетов, {winner_prob:.2f}%)"
+            await bot.edit_message_text(edit_text, chat_id=announce_chat_id, message_id=mid)
+            winner_id = await get_user_id_by_username(winner)
+            if winner_id:
+                await bot.send_message(winner_id, f"🎉 Вы выиграли {prizes[i]}! Напишите админу.")
+
+    await notify_all_users(f"🏁 Конкурс завершился! Победители: {winners_text}")
 
     await send_admin_log()
 
