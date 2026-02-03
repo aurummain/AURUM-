@@ -77,7 +77,8 @@ CREATE TABLE IF NOT EXISTS contest (
     end_time TEXT,
     duration_minutes INTEGER DEFAULT 10,
     cost_per_ticket INTEGER DEFAULT 10000,
-    selected_winners TEXT DEFAULT '[]'  -- JSON список выбранных победителей
+    selected_winners TEXT DEFAULT '[]',  -- JSON список выбранных победителей
+    prize_message_ids TEXT DEFAULT '[]'  -- JSON список message_id для призов
 )
 """)
 cur.execute("INSERT OR IGNORE INTO contest (id, is_active, duration_minutes, cost_per_ticket) VALUES (1, 0, 10, 10000)")
@@ -567,13 +568,24 @@ async def admin_start(callback: types.CallbackQuery):
 
     end_time = (datetime.utcnow() + timedelta(minutes=duration_minutes)).isoformat()
 
-    cur.execute("UPDATE contest SET is_active = 1, end_time = ?, selected_winners = '[]' WHERE id = 1", (end_time,))
+    cur.execute("UPDATE contest SET is_active = 1, end_time = ?, selected_winners = '[]', prize_message_ids = '[]' WHERE id = 1", (end_time,))
     conn.commit()
 
-    initial_text = f"🎉 Конкурс запущен!\nПризы: {prizes_text}\nОсталось: {duration_minutes:02d}:00\nБилетов: 0"
-
-    msg = await bot.send_message(announce_chat_id, initial_text, reply_markup=await contest_kb())
+    # Первое сообщение: анонс
+    announce_text = f"🎉 Конкурс запущен!\nПризы: {prizes_text}\nОсталось: {duration_minutes:02d}:00\nБилетов: 0"
+    msg = await bot.send_message(announce_chat_id, announce_text, reply_markup=await contest_kb())
     announce_message_id = msg.message_id
+
+    # Вторые сообщения: для каждого приза
+    prize_message_ids = []
+    for prize in prizes:
+        prize_text = f"Приз: {prize}"  # Ссылка, если приз — URL, иначе текст
+        prize_msg = await bot.send_message(announce_chat_id, prize_text)
+        prize_message_ids.append(prize_msg.message_id)
+
+    prize_ids_json = json.dumps(prize_message_ids)
+    cur.execute("UPDATE contest SET prize_message_ids = ? WHERE id = 1", (prize_ids_json,))
+    conn.commit()
 
     if timer_task and not timer_task.done():
         timer_task.cancel()
@@ -740,12 +752,12 @@ async def admin_view_balances(callback: types.CallbackQuery):
         await callback.answer("Нет доступа", show_alert=True)
         return
 
-    cur.execute("SELECT username, balance, tickets FROM users WHERE username IS NOT NULL")
+    cur.execute("SELECT user_id, username, balance, tickets FROM users")
     rows = cur.fetchall()
     if not rows:
         await callback.message.answer("Нет игроков")
     else:
-        text = "Балансы:\n" + "\n".join([f"@{r[0]}: {r[1]} AUR, {r[2]} билетов" for r in rows])
+        text = "Балансы:\n" + "\n".join([f"@{r[1] or f'ID{r[0]}'}: {r[2]} AUR, {r[3]} билетов" for r in rows])
         await callback.message.answer(text)
     await callback.answer()
 
@@ -795,16 +807,27 @@ async def update_timer():
             print(f"Ошибка редактирования таймера: {e}")
 
 async def perform_draw(total_tickets):
-    cur.execute("SELECT selected_winners, prizes FROM contest WHERE id = 1")
+    cur.execute("SELECT selected_winners, prizes, prize_message_ids FROM contest WHERE id = 1")
     row = cur.fetchone()
     selected_json = row[0] or '[]'
     selected = json.loads(selected_json)
     prizes = json.loads(row[1] or '[]')
+    prize_message_ids = json.loads(row[2] or '[]')
     num_prizes = len(prizes)
 
     if selected:
         winners = selected[:num_prizes]
+        winners_text = ", ".join([f"@{w}" for w in winners])
+        text = f"🎉 Конкурс завершён!\nПобедители: {winners_text}\nПоздравляем!"
+        # Редактировать сообщения призов
+        for i, mid in enumerate(prize_message_ids):
+            if i < len(winners):
+                winner = winners[i]
+                winner_tickets, winner_prob = await get_winner_stats(winner, total_tickets)
+                edit_text = f"Победитель приза {prizes[i]}: @{winner} ({winner_tickets} билетов, {winner_prob:.2f}%)"
+                await bot.edit_message_text(edit_text, chat_id=announce_chat_id, message_id=mid)
     else:
+        # Автоматический выбор
         if total_tickets == 0:
             text = "Конкурс завершён. Никто не купил билеты."
             winners = []
@@ -828,17 +851,18 @@ async def perform_draw(total_tickets):
                 if w_username:
                     winners.append(w_username)
 
-    if winners:
-        winners_text = ", ".join([f"@{w}" for w in winners])
-        text = f"🎉 Конкурс завершён!\nПобедители: {winners_text}\nПоздравляем!"
-        for i, winner in enumerate(winners):
-            prize = prizes[i] if i < len(prizes) else "Дополнительный приз"
-            winner_id = await get_user_id_by_username(winner)
-            if winner_id:
-                await bot.send_message(winner_id, f"🎉 Вы выиграли {prize}! Напишите админу.")
-        await bot.send_message(ADMIN_ID, f"Победители: {winners_text}")
-    else:
-        text = "Конкурс завершён. Нет победителей."
+        if winners:
+            winners_text = ", ".join([f"@{w}" for w in winners])
+            text = f"🎉 Конкурс завершён!\nПобедители: {winners_text}\nПоздравляем!"
+            # Редактировать сообщения призов для автоматического
+            for i, mid in enumerate(prize_message_ids):
+                if i < len(winners):
+                    winner = winners[i]
+                    winner_tickets, winner_prob = await get_winner_stats(winner, total_tickets)
+                    edit_text = f"Победитель приза {prizes[i]}: @{winner} ({winner_tickets} билетов, {winner_prob:.2f}%)"
+                    await bot.edit_message_text(edit_text, chat_id=announce_chat_id, message_id=mid)
+        else:
+            text = "Конкурс завершён. Нет победителей."
 
     await bot.edit_message_text(
         text,
@@ -855,10 +879,11 @@ async def perform_draw(total_tickets):
     conn.commit()
     print("Розыгрыш завершён, билеты сброшены")
 
-async def get_user_id_by_username(username):
-    cur.execute("SELECT user_id FROM users WHERE username = ?", (username,))
-    row = cur.fetchone()
-    return row[0] if row else None
+async def get_winner_stats(username, total_tickets):
+    cur.execute("SELECT tickets FROM users WHERE username = ?", (username,))
+    tickets = cur.fetchone()[0] or 0
+    prob = (tickets / total_tickets * 100) if total_tickets > 0 else 0
+    return tickets, prob
 
 async def notify_all_users(text):
     cur.execute("SELECT user_id FROM users")
