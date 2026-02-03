@@ -2,6 +2,7 @@ import asyncio
 import os
 import sqlite3
 import random
+import json
 from datetime import datetime, timedelta
 
 import aiohttp
@@ -21,16 +22,22 @@ TON_WALLET = "UQBJNtgVfE-x7-K1uY_EhW1rdvGKhq5gM244fX89VF0bof7R"
 DEFAULT_COST_PER_TICKET = 10000
 DEFAULT_CONTEST_MINUTES = 10
 TIMER_UPDATE_INTERVAL = 15
+RATE_LIMIT_SECONDS = 5  # Антиспам: мин. интервал между командами
+BAN_DURATION_MINUTES = 5  # Длительность блока при спаме
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
+
+# Глобальный словарь для rate limit (user_id: last_time)
+rate_limit_dict = {}
+
 # ──────────────────── FSM ────────────────────
 
 class TopUpState(StatesGroup):
     waiting_amount = State()
 
-class SetPrizeState(StatesGroup):
-    waiting_prize = State()
+class SetPrizesState(StatesGroup):
+    waiting_prizes = State()
 
 class BuyTicketsState(StatesGroup):
     waiting_quantity = State()
@@ -40,6 +47,9 @@ class SetDurationState(StatesGroup):
 
 class SetCostState(StatesGroup):
     waiting_cost = State()
+
+class SelectWinnersState(StatesGroup):
+    selecting = State()
 
 # ──────────────────── БАЗА ДАННЫХ ────────────────────
 
@@ -53,18 +63,20 @@ CREATE TABLE IF NOT EXISTS users (
     balance INTEGER DEFAULT 0,
     tickets INTEGER DEFAULT 0,
     referrer_id INTEGER,
-    rewarded_referrer INTEGER DEFAULT 0
+    rewarded_referrer INTEGER DEFAULT 0,
+    banned_until TEXT DEFAULT NULL
 )
 """)
 
 cur.execute("""
 CREATE TABLE IF NOT EXISTS contest (
     id INTEGER PRIMARY KEY,
-    prize TEXT,
+    prizes TEXT DEFAULT '[]',  -- JSON список призов
     is_active INTEGER DEFAULT 0,
     end_time TEXT,
     duration_minutes INTEGER DEFAULT 10,
-    cost_per_ticket INTEGER DEFAULT 10000
+    cost_per_ticket INTEGER DEFAULT 10000,
+    selected_winners TEXT DEFAULT '[]'  -- JSON список выбранных победителей
 )
 """)
 cur.execute("INSERT OR IGNORE INTO contest (id, is_active, duration_minutes, cost_per_ticket) VALUES (1, 0, 10, 10000)")
@@ -76,6 +88,28 @@ conn.commit()
 announce_chat_id: int | None = None
 announce_message_id: int | None = None
 timer_task: asyncio.Task | None = None
+five_min_notified = False  # Флаг для уведомления "осталось 5 мин"
+
+# ──────────────────── Антиспам функция ────────────────────
+
+async def check_rate_limit_and_ban(user_id: int):
+    now = datetime.utcnow().timestamp()
+    last_time = rate_limit_dict.get(user_id, 0)
+    if now - last_time < RATE_LIMIT_SECONDS:
+        # Спам: Блок на BAN_DURATION_MINUTES
+        ban_until = (datetime.utcnow() + timedelta(minutes=BAN_DURATION_MINUTES)).isoformat()
+        cur.execute("UPDATE users SET banned_until = ? WHERE user_id = ?", (ban_until, user_id))
+        conn.commit()
+        return True  # Заблокирован
+    rate_limit_dict[user_id] = now
+    # Проверить текущий бан
+    cur.execute("SELECT banned_until FROM users WHERE user_id = ?", (user_id,))
+    row = cur.fetchone()
+    if row and row[0]:
+        ban_time = datetime.fromisoformat(row[0]).timestamp()
+        if now < ban_time:
+            return True  # Ещё заблокирован
+    return False  # OK
 
 # ──────────────────── КЛАВИАТУРЫ ────────────────────
 
@@ -92,9 +126,10 @@ def admin_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="▶️ Запустить конкурс", callback_data="admin_start")],
         [InlineKeyboardButton(text="⏹ Остановить конкурс", callback_data="admin_stop")],
-        [InlineKeyboardButton(text="🏆 Установить приз", callback_data="set_prize")],
+        [InlineKeyboardButton(text="🏆 Установить призы", callback_data="set_prizes")],
         [InlineKeyboardButton(text="⏰ Установить время раунда", callback_data="set_duration")],
         [InlineKeyboardButton(text="💰 Установить стоимость билета", callback_data="set_cost")],
+        [InlineKeyboardButton(text="🏅 Выбрать победителей", callback_data="select_winners")],
         [InlineKeyboardButton(text="👥 Балансы игроков", callback_data="admin_view_balances")],
     ])
 
@@ -113,31 +148,51 @@ def confirm_topup_kb(user_id: int, amount: int):
         [InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_{user_id}_{amount}")]
     ])
 
+# Клавиатура для выбора победителей (динамическая)
+def get_select_winners_kb(participants, selected):
+    kb = []
+    for username in participants:
+        text = f"@{username}" + (" ✅" if username in selected else "")
+        cb_data = f"toggle_winner_{username}"
+        kb.append([InlineKeyboardButton(text=text, callback_data=cb_data)])
+    kb.append([InlineKeyboardButton(text="Подтвердить выбор", callback_data="confirm_winners")])
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+
 # ──────────────────── HANDLERS ────────────────────
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
+    if await check_rate_limit_and_ban(message.from_user.id):
+        await message.answer("Вы заблокированы за спам. Подождите.")
+        return
+
     args = message.text.split()
     referrer_id = int(args[1]) if len(args) > 1 and args[1].isdigit() else None
 
     user = message.from_user
-    cur.execute(
-        "INSERT OR IGNORE INTO users (user_id, username, referrer_id) VALUES (?, ?, ?)",
-        (user.id, user.username, referrer_id)
-    )
-    conn.commit()
+    cur.execute("SELECT referrer_id FROM users WHERE user_id = ?", (user.id,))
+    existing = cur.fetchone()
 
-    # Уведомление рефереру о новом реферале
-    if referrer_id:
-        try:
-            referrer_username = user.username or f"ID{user.id}"
-            await bot.send_message(referrer_id, f"У вас новый реферал: @{referrer_username}")
-        except Exception as e:
-            print(f"Ошибка уведомления реферера: {e}")
+    if not existing:
+        cur.execute(
+            "INSERT INTO users (user_id, username, referrer_id) VALUES (?, ?, ?)",
+            (user.id, user.username, referrer_id)
+        )
+        conn.commit()
+        # Уведомление только при новой регистрации
+        if referrer_id:
+            try:
+                await bot.send_message(referrer_id, f"У вас новый реферал: @{user.username or f'ID{user.id}'}")
+            except Exception as e:
+                print(f"Ошибка уведомления реферера: {e}")
+    elif referrer_id and existing[0] != referrer_id:
+        # Не перезаписывать referrer_id
+        pass
 
-    cur.execute("SELECT is_active, prize, end_time FROM contest WHERE id = 1")
+    cur.execute("SELECT is_active, prizes, end_time FROM contest WHERE id = 1")
     row = cur.fetchone()
-    is_active, prize, end_time = row if row else (0, None, None)
+    is_active, prizes_json, end_time = row if row else (0, '[]', None)
+    prizes = json.loads(prizes_json)
 
     if message.chat.type == "private":
         if user.id == ADMIN_ID:
@@ -152,7 +207,8 @@ async def cmd_start(message: types.Message):
                     m, s = divmod(int(remaining.total_seconds()), 60)
                     cur.execute("SELECT SUM(tickets) FROM users")
                     total = cur.fetchone()[0] or 0
-                    text = f"🎉 Активный конкурс!\nПриз: {prize}\nОсталось: {m:02d}:{s:02d}\nБилетов всего: {total}"
+                    prizes_text = ", ".join(prizes) if prizes else "Приз не установлен"
+                    text = f"🎉 Активный конкурс!\nПризы: {prizes_text}\nОсталось: {m:02d}:{s:02d}\nБилетов всего: {total}"
                     await message.answer(text, reply_markup=await contest_kb())
                     return
             except Exception as e:
@@ -185,12 +241,18 @@ async def cb_topup(callback: types.CallbackQuery, state: FSMContext):
     if callback.message.chat.type != "private":
         await callback.answer("Только в ЛС", show_alert=True)
         return
+    if await check_rate_limit_and_ban(callback.from_user.id):
+        await callback.answer("Вы заблокированы за спам.", show_alert=True)
+        return
     await callback.message.answer("Введите сумму пополнения:")
     await state.set_state(TopUpState.waiting_amount)
     await callback.answer()
 
 @dp.message(TopUpState.waiting_amount)
 async def process_topup(message: types.Message, state: FSMContext):
+    if await check_rate_limit_and_ban(message.from_user.id):
+        return
+
     if not message.text.isdigit():
         await message.answer("Введите число")
         return
@@ -260,6 +322,9 @@ async def start_buy_tickets(callback: types.CallbackQuery, state: FSMContext):
     if callback.message.chat.type != "private":
         await callback.answer("Только в ЛС", show_alert=True)
         return
+    if await check_rate_limit_and_ban(callback.from_user.id):
+        await callback.answer("Вы заблокированы за спам.", show_alert=True)
+        return
     uid = callback.from_user.id
     cur.execute("SELECT balance FROM users WHERE user_id = ?", (uid,))
     row = cur.fetchone()
@@ -274,6 +339,9 @@ async def start_buy_tickets(callback: types.CallbackQuery, state: FSMContext):
 
 @dp.message(BuyTicketsState.waiting_quantity)
 async def process_buy_tickets(message: types.Message, state: FSMContext):
+    if await check_rate_limit_and_ban(message.from_user.id):
+        return
+
     if not message.text.isdigit() or int(message.text) <= 0:
         await message.answer("Введите положительное целое число")
         return
@@ -302,7 +370,7 @@ async def process_buy_tickets(message: types.Message, state: FSMContext):
         cur.execute("UPDATE users SET tickets = tickets + 1 WHERE user_id = ?", (referrer_id,))
         cur.execute("UPDATE users SET rewarded_referrer = 1 WHERE user_id = ?", (uid,))
         
-        # Уведомления
+        # Уведомление рефереру (только один раз)
         buyer_username = message.from_user.username or f"ID{uid}"
         try:
             await bot.send_message(referrer_id, f"Ваш реферал @{buyer_username} купил билет — вы получили 1 билет!")
@@ -328,6 +396,9 @@ async def process_buy_tickets(message: types.Message, state: FSMContext):
 
 @dp.callback_query(lambda c: c.data == "balance")
 async def balance(callback: types.CallbackQuery):
+    if await check_rate_limit_and_ban(callback.from_user.id):
+        await callback.answer("Вы заблокированы за спам.", show_alert=True)
+        return
     cur.execute("SELECT balance, tickets FROM users WHERE user_id = ?", (callback.from_user.id,))
     bal, tik = cur.fetchone() or (0, 0)
     cur.execute("SELECT SUM(tickets) FROM users")
@@ -341,6 +412,9 @@ async def balance(callback: types.CallbackQuery):
 
 @dp.callback_query(lambda c: c.data == "ref")
 async def ref(callback: types.CallbackQuery):
+    if await check_rate_limit_and_ban(callback.from_user.id):
+        await callback.answer("Вы заблокированы за спам.", show_alert=True)
+        return
     me = await bot.get_me()
     await callback.message.answer(
         f"https://t.me/{me.username}?start={callback.from_user.id}"
@@ -349,13 +423,16 @@ async def ref(callback: types.CallbackQuery):
 
 @dp.callback_query(lambda c: c.data == "stats")
 async def stats(callback: types.CallbackQuery):
+    if await check_rate_limit_and_ban(callback.from_user.id):
+        await callback.answer("Вы заблокированы за спам.", show_alert=True)
+        return
     cur.execute("SELECT is_active FROM contest WHERE id = 1")
     is_active = cur.fetchone()[0]
     if not is_active:
         await callback.answer("Нет активного конкурса", show_alert=True)
         return
 
-    cur.execute("SELECT user_id, username, tickets FROM users WHERE tickets > 0 ORDER BY tickets DESC")
+    cur.execute("SELECT username, tickets FROM users WHERE tickets > 0 ORDER BY tickets DESC")
     rows = cur.fetchall()
     cur.execute("SELECT SUM(tickets) FROM users")
     total_tickets = cur.fetchone()[0] or 0
@@ -366,9 +443,10 @@ async def stats(callback: types.CallbackQuery):
         return
 
     text = "📈 Статистика шансов на победу:\n"
-    for uid, username, tickets in rows:
-        prob = (tickets / total_tickets) * 100
-        text += f"@{username or uid}: {tickets} билетов ({prob:.2f}%)\n"
+    for username, tickets in rows:
+        if username:
+            prob = (tickets / total_tickets) * 100
+            text += f"@{username}: {tickets} билетов ({prob:.2f}%)\n"
 
     text += f"\nВсего билетов: {total_tickets}"
 
@@ -377,6 +455,8 @@ async def stats(callback: types.CallbackQuery):
 
 @dp.message(Command("send"))
 async def cmd_send(message: types.Message):
+    if await check_rate_limit_and_ban(message.from_user.id):
+        return
     sender_id = message.from_user.id
     cur.execute("SELECT tickets FROM users WHERE user_id = ?", (sender_id,))
     sender_row = cur.fetchone()
@@ -385,7 +465,6 @@ async def cmd_send(message: types.Message):
         return
 
     if message.reply_to_message:
-        # Отправка в ответ на сообщение
         recipient_id = message.reply_to_message.from_user.id
         if recipient_id == sender_id:
             await message.reply("Нельзя отправить билеты себе.")
@@ -396,12 +475,11 @@ async def cmd_send(message: types.Message):
             return
         quantity = int(args[0])
     else:
-        # Отправка по username
         args = message.text.split()[1:]
         if len(args) != 2 or not args[0].startswith('@') or not args[1].isdigit():
             await message.reply("Формат: /send @username <количество>")
             return
-        username = args[0][1:]  # убрать @
+        username = args[0][1:]
         quantity = int(args[1])
         cur.execute("SELECT user_id FROM users WHERE username = ?", (username,))
         recipient_row = cur.fetchone()
@@ -423,15 +501,12 @@ async def cmd_send(message: types.Message):
         await message.reply(f"У вас только {sender_tickets} билетов.")
         return
 
-    # Обеспечить существование получателя в БД
     cur.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (recipient_id,))
 
-    # Транзакция
     cur.execute("UPDATE users SET tickets = tickets - ? WHERE user_id = ?", (quantity, sender_id))
     cur.execute("UPDATE users SET tickets = tickets + ? WHERE user_id = ?", (quantity, recipient_id))
     conn.commit()
 
-    # Уведомления
     sender_username = message.from_user.username or f"ID{sender_id}"
     recipient_username = (await bot.get_chat(recipient_id)).username or f"ID{recipient_id}"
 
@@ -439,9 +514,8 @@ async def cmd_send(message: types.Message):
     try:
         await bot.send_message(recipient_id, f"🎟 Получено {quantity} билет(ов) от @{sender_username}")
     except:
-        pass  # Если нельзя отправить ЛС, игнор
+        pass
 
-    # Обновить общее количество если нужно
     if announce_chat_id:
         cur.execute("SELECT SUM(tickets) FROM users")
         total = cur.fetchone()[0] or 0
@@ -457,7 +531,7 @@ async def cmd_send(message: types.Message):
 
 @dp.callback_query(lambda c: c.data == "admin_start")
 async def admin_start(callback: types.CallbackQuery):
-    global announce_chat_id, announce_message_id, timer_task
+    global announce_chat_id, announce_message_id, timer_task, five_min_notified
 
     if callback.from_user.id != ADMIN_ID:
         await callback.answer("Нет доступа", show_alert=True)
@@ -468,17 +542,19 @@ async def admin_start(callback: types.CallbackQuery):
         await callback.answer()
         return
 
-    cur.execute("SELECT prize, duration_minutes FROM contest WHERE id = 1")
+    cur.execute("SELECT prizes, duration_minutes FROM contest WHERE id = 1")
     row = cur.fetchone()
-    prize = row[0] if row[0] else "Приз не установлен"
+    prizes_json = row[0] or '[]'
+    prizes = json.loads(prizes_json)
+    prizes_text = ", ".join(prizes) if prizes else "Приз не установлен"
     duration_minutes = row[1]
 
     end_time = (datetime.utcnow() + timedelta(minutes=duration_minutes)).isoformat()
 
-    cur.execute("UPDATE contest SET is_active = 1, end_time = ? WHERE id = 1", (end_time,))
+    cur.execute("UPDATE contest SET is_active = 1, end_time = ?, selected_winners = '[]' WHERE id = 1", (end_time,))
     conn.commit()
 
-    initial_text = f"🎉 Конкурс запущен!\nПриз: {prize}\nОсталось: {duration_minutes:02d}:00\nБилетов: 0"
+    initial_text = f"🎉 Конкурс запущен!\nПризы: {prizes_text}\nОсталось: {duration_minutes:02d}:00\nБилетов: 0"
 
     msg = await bot.send_message(announce_chat_id, initial_text, reply_markup=await contest_kb())
     announce_message_id = msg.message_id
@@ -486,14 +562,18 @@ async def admin_start(callback: types.CallbackQuery):
     if timer_task and not timer_task.done():
         timer_task.cancel()
 
+    five_min_notified = False
     timer_task = asyncio.create_task(update_timer())
+
+    # Рассылка уведомления "Конкурс начался" всем пользователям
+    await notify_all_users("🎉 Конкурс начался! Участвуйте и покупайте билеты.")
 
     await callback.message.answer("Конкурс запущен!")
     await callback.answer("Запущен")
 
 @dp.callback_query(lambda c: c.data == "admin_stop")
 async def admin_stop(callback: types.CallbackQuery):
-    global timer_task
+    global timer_task, five_min_notified
     if callback.from_user.id != ADMIN_ID:
         await callback.answer("Нет доступа", show_alert=True)
         return
@@ -514,22 +594,23 @@ async def admin_stop(callback: types.CallbackQuery):
     await callback.message.answer("Конкурс остановлен")
     await callback.answer()
 
-@dp.callback_query(lambda c: c.data == "set_prize")
-async def admin_set_prize(callback: types.CallbackQuery, state: FSMContext):
+@dp.callback_query(lambda c: c.data == "set_prizes")
+async def admin_set_prizes(callback: types.CallbackQuery, state: FSMContext):
     if callback.from_user.id != ADMIN_ID:
         await callback.answer("Нет доступа", show_alert=True)
         return
 
-    await callback.message.answer("Введите текст приза:")
-    await state.set_state(SetPrizeState.waiting_prize)
+    await callback.message.answer("Введите призы через запятую (например: NFT1, NFT2, 100 AUR):")
+    await state.set_state(SetPrizesState.waiting_prizes)
     await callback.answer()
 
-@dp.message(SetPrizeState.waiting_prize)
-async def process_prize(message: types.Message, state: FSMContext):
-    prize = message.text.strip()
-    cur.execute("UPDATE contest SET prize = ? WHERE id = 1", (prize,))
+@dp.message(SetPrizesState.waiting_prizes)
+async def process_prizes(message: types.Message, state: FSMContext):
+    prizes = [p.strip() for p in message.text.split(',') if p.strip()]
+    prizes_json = json.dumps(prizes)
+    cur.execute("UPDATE contest SET prizes = ? WHERE id = 1", (prizes_json,))
     conn.commit()
-    await message.answer(f"Приз установлен: {prize}")
+    await message.answer(f"Призы установлены: {', '.join(prizes)}")
     await state.clear()
 
 @dp.callback_query(lambda c: c.data == "set_duration")
@@ -576,30 +657,90 @@ async def process_cost(message: types.Message, state: FSMContext):
     await message.answer(f"Стоимость билета установлена: {cost} AUR")
     await state.clear()
 
+@dp.callback_query(lambda c: c.data == "select_winners")
+async def admin_select_winners(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    cur.execute("SELECT is_active FROM contest WHERE id = 1")
+    if not cur.fetchone()[0]:
+        await callback.answer("Нет активного конкурса", show_alert=True)
+        return
+
+    cur.execute("SELECT username FROM users WHERE tickets > 0 AND username IS NOT NULL")
+    participants = [row[0] for row in cur.fetchall()]
+
+    if not participants:
+        await callback.message.answer("Нет участников с билетами")
+        return
+
+    cur.execute("SELECT selected_winners, prizes FROM contest WHERE id = 1")
+    row = cur.fetchone()
+    selected_json = row[0] or '[]'
+    selected = json.loads(selected_json)
+    num_prizes = len(json.loads(row[1] or '[]'))
+
+    await state.update_data(participants=participants, selected=selected, num_prizes=num_prizes)
+    await callback.message.answer("Выберите победителей:", reply_markup=get_select_winners_kb(participants, selected))
+    await state.set_state(SelectWinnersState.selecting)
+
+@dp.callback_query(SelectWinnersState.selecting)
+async def toggle_winner(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID:
+        return
+
+    data = await state.get_data()
+    participants = data.get('participants', [])
+    selected = data.get('selected', [])
+    num_prizes = data.get('num_prizes', 1)
+
+    if callback.data.startswith("toggle_winner_"):
+        username = callback.data.split("_", 2)[2]
+        if username in selected:
+            selected.remove(username)
+        else:
+            if len(selected) < num_prizes:
+                selected.append(username)
+            else:
+                await callback.answer(f"Максимум {num_prizes} победителей", show_alert=True)
+                return
+
+        await state.update_data(selected=selected)
+        await callback.message.edit_reply_markup(reply_markup=get_select_winners_kb(participants, selected))
+        await callback.answer()
+
+    elif callback.data == "confirm_winners":
+        selected_json = json.dumps(selected)
+        cur.execute("UPDATE contest SET selected_winners = ? WHERE id = 1", (selected_json,))
+        conn.commit()
+        await callback.message.answer(f"Победители выбраны: {', '.join(['@' + u for u in selected])}")
+        await state.clear()
+
 @dp.callback_query(lambda c: c.data == "admin_view_balances")
 async def admin_view_balances(callback: types.CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
         await callback.answer("Нет доступа", show_alert=True)
         return
 
-    cur.execute("SELECT user_id, username, balance, tickets FROM users")
+    cur.execute("SELECT username, balance, tickets FROM users WHERE username IS NOT NULL")
     rows = cur.fetchall()
     if not rows:
         await callback.message.answer("Нет игроков")
     else:
-        text = "Балансы:\n" + "\n".join([f"@{r[1] or r[0]}: {r[2]} AUR, {r[3]} билетов" for r in rows])
+        text = "Балансы:\n" + "\n".join([f"@{r[0]}: {r[1]} AUR, {r[2]} билетов" for r in rows])
         await callback.message.answer(text)
     await callback.answer()
 
 # ──────────────────── ТАЙМЕР + РОЗЫГРЫШ ────────────────────
 
 async def update_timer():
-    global announce_chat_id, announce_message_id
+    global announce_chat_id, announce_message_id, five_min_notified
 
     while True:
         await asyncio.sleep(TIMER_UPDATE_INTERVAL)
 
-        cur.execute("SELECT is_active, end_time, prize FROM contest WHERE id = 1")
+        cur.execute("SELECT is_active, end_time, prizes FROM contest WHERE id = 1")
         row = cur.fetchone()
         if not row or row[0] == 0 or not row[1]:
             print("Таймер остановлен: конкурс не активен")
@@ -611,13 +752,19 @@ async def update_timer():
         cur.execute("SELECT SUM(tickets) FROM users")
         total_tickets = cur.fetchone()[0] or 0
 
+        if remaining.total_seconds() <= 300 and not five_min_notified and remaining.total_seconds() > 0:
+            await notify_all_users("⏰ Осталось 5 минут до конца конкурса! Спешите купить билеты.")
+            five_min_notified = True
+
         if remaining.total_seconds() <= 0:
             print("Таймер завершён → запуск розыгрыша")
             await perform_draw(total_tickets)
             break
 
         m, s = divmod(int(remaining.total_seconds()), 60)
-        text = f"🎉 Конкурс идёт\nПриз: {row[2]}\nОсталось: {m:02d}:{s:02d}\nБилетов: {total_tickets}"
+        prizes = json.loads(row[2] or '[]')
+        prizes_text = ", ".join(prizes) if prizes else "Приз не установлен"
+        text = f"🎉 Конкурс идёт\nПризы: {prizes_text}\nОсталось: {m:02d}:{s:02d}\nБилетов: {total_tickets}"
 
         try:
             await bot.edit_message_text(
@@ -631,25 +778,49 @@ async def update_timer():
             print(f"Ошибка редактирования таймера: {e}")
 
 async def perform_draw(total_tickets):
-    if total_tickets == 0:
-        text = "Конкурс завершён. Никто не купил билеты."
+    cur.execute("SELECT selected_winners, prizes FROM contest WHERE id = 1")
+    row = cur.fetchone()
+    selected_json = row[0] or '[]'
+    selected = json.loads(selected_json)
+    prizes = json.loads(row[1] or '[]')
+    num_prizes = len(prizes)
+
+    if selected:
+        winners = selected[:num_prizes]  # Берем выбранных, до кол-ва призов
     else:
-        cur.execute("SELECT user_id, tickets FROM users WHERE tickets > 0")
-        participants = cur.fetchall()
+        # Авто-выбор, если не выбраны
+        if total_tickets == 0:
+            text = "Конкурс завершён. Никто не купил билеты."
+            winners = []
+        else:
+            cur.execute("SELECT user_id, tickets FROM users WHERE tickets > 0")
+            participants = cur.fetchall()
 
-        pool = []
-        for uid, count in participants:
-            pool.extend([uid] * count)
+            pool = []
+            for uid, count in participants:
+                pool.extend([uid] * count)
 
-        winner_id = random.choice(pool)
+            winners_ids = set()
+            while len(winners_ids) < min(num_prizes, len(set(pool))):
+                winner_id = random.choice(pool)
+                winners_ids.add(winner_id)
 
-        cur.execute("SELECT username FROM users WHERE user_id = ?", (winner_id,))
-        winner_username = cur.fetchone()[0] or f"ID{winner_id}"
+            winners = []
+            for wid in winners_ids:
+                cur.execute("SELECT username FROM users WHERE user_id = ?", (wid,))
+                winners.append(cur.fetchone()[0] or f"ID{wid}")
 
-        text = f"🎉 Конкурс завершён!\nПобедитель: @{winner_username}\nПоздравляем!"
-
-        await bot.send_message(winner_id, "🎉 Вы выиграли! Напишите админу за призом.")
-        await bot.send_message(ADMIN_ID, f"Победитель: @{winner_username} (ID {winner_id})")
+    if winners:
+        winners_text = ", ".join([f"@{w}" for w in winners])
+        text = f"🎉 Конкурс завершён!\nПобедители: {winners_text}\nПоздравляем!"
+        for i, winner in enumerate(winners):
+            prize = prizes[i] if i < len(prizes) else "Дополнительный приз"
+            winner_id = await get_user_id_by_username(winner)  # Функция для получения ID по username
+            if winner_id:
+                await bot.send_message(winner_id, f"🎉 Вы выиграли {prize}! Напишите админу.")
+        await bot.send_message(ADMIN_ID, f"Победители: {winners_text}")
+    else:
+        text = "Конкурс завершён. Нет победителей."
 
     await bot.edit_message_text(
         text,
@@ -657,10 +828,44 @@ async def perform_draw(total_tickets):
         message_id=announce_message_id
     )
 
+    # Рассылка уведомления "Конкурс завершился"
+    await notify_all_users(f"🏁 Конкурс завершился! Победители: {winners_text if winners else 'Нет'}")
+
+    # Лог админу
+    await send_admin_log()
+
     cur.execute("UPDATE contest SET is_active = 0, end_time = NULL WHERE id = 1")
     cur.execute("UPDATE users SET tickets = 0")
     conn.commit()
     print("Розыгрыш завершён, билеты сброшены")
+
+async def get_user_id_by_username(username):
+    cur.execute("SELECT user_id FROM users WHERE username = ?", (username,))
+    row = cur.fetchone()
+    return row[0] if row else None
+
+async def notify_all_users(text):
+    cur.execute("SELECT user_id FROM users")
+    users = cur.fetchall()
+    for uid in users:
+        try:
+            await bot.send_message(uid[0], text)
+        except Exception as e:
+            print(f"Ошибка рассылки: {e}")
+
+async def send_admin_log():
+    cur.execute("SELECT username, tickets FROM users WHERE tickets > 0")
+    participants = cur.fetchall()
+    num_participants = len(participants)
+    total_tickets = sum([p[1] for p in participants])
+
+    text = f"Лог конкурса:\nУчастников: {num_participants}\nВсего билетов: {total_tickets}\n"
+    for username, tickets in participants:
+        if username:
+            prob = (tickets / total_tickets * 100) if total_tickets > 0 else 0
+            text += f"@{username}: {tickets} билетов ({prob:.2f}%)\n"
+
+    await bot.send_message(ADMIN_ID, text)
 
 # ──────────────────── KEEP-ALIVE (self-ping) ────────────────────
 
