@@ -3,6 +3,7 @@ import os
 import sqlite3
 import random
 import json
+import re  # Добавлен для парсинга
 from datetime import datetime, timedelta, timezone
 
 import aiohttp
