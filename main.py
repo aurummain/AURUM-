@@ -3,7 +3,7 @@ import os
 import sqlite3
 import random
 import json
-import re  # Добавлен для парсинга
+import re  # Для парсинга строк списка
 from datetime import datetime, timedelta, timezone
 
 import aiohttp
@@ -56,6 +56,9 @@ class SetCostAurState(StatesGroup):
 
 class SetCostTonState(StatesGroup):
     waiting_cost = State()
+
+class RestoreListState(StatesGroup):
+    waiting_list = State()  # Новый state для ожидания списка
 
 # ──────────────────── БАЗА ДАННЫХ ────────────────────
 
@@ -170,6 +173,7 @@ def admin_kb():
         [InlineKeyboardButton(text="💰 Установить стоимость билета AUR", callback_data="set_cost_aur")],
         [InlineKeyboardButton(text="💰 Установить стоимость билета TON", callback_data="set_cost_ton")],
         [InlineKeyboardButton(text="👥 Балансы игроков", callback_data="admin_view_balances")],
+        [InlineKeyboardButton(text="🔄 Восстановить список", callback_data="admin_restore_list")],  # Новая кнопка
     ])
 
 async def contest_kb():
@@ -994,3 +998,4 @@ if __name__ == "__main__":
         print("Остановка бота")
     finally:
         asyncio.run(bot.session.close())
+``` await callback
