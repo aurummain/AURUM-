@@ -1069,8 +1069,6 @@ async def fake_web_server():
     print(f"Сервер запущен на порту {port}")
 
 # ──────────────────── ЗАПУСК ────────────────────
-
-
 async def main():
     print("Бот запущен")
     await asyncio.gather(
@@ -1090,4 +1088,3 @@ if __name__ == "__main__":
         print("Остановка бота")
     finally:
         asyncio.run(bot.session.close())
-``` quantity,
