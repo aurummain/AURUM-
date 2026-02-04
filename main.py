@@ -998,4 +998,4 @@ if __name__ == "__main__":
         print("Остановка бота")
     finally:
         asyncio.run(bot.session.close())
-``` await callback
+```_query(lambda
