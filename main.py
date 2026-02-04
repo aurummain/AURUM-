@@ -16,7 +16,7 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 # ──────────────────── НАСТРОЙКИ ────────────────────
 
-BOT_TOKEN = "8323563478:AAE9qcdBfdvO1ptKkCXS78hJ4SuxeFOnV2w"
+BOT_TOKEN = "8274963448:AAE06C6g-0A7aWoPMI51zos3IIsevhxDwSE"
 ADMIN_ID = 1333099097
 TON_WALLET = "UQBJNtgVfE-x7-K1uY_EhW1rdvGKhq5gM244fX89VF0bof7R"
 
@@ -319,9 +319,10 @@ async def process_topup_amount(message: types.Message, state: FSMContext):
         parse_mode="HTML"
     )
 
+    username = message.from_user.username or f"ID{message.from_user.id}"
     await bot.send_message(
         ADMIN_ID,
-        f"🟢 Запрос пополнения\nОт: {message.from_user.id}\nВалюта: {currency}\nСумма: {amount}",
+        f"🟢 Запрос пополнения\nОт: @{username}\nВалюта: {currency}\nСумма: {amount}",
         reply_markup=confirm_topup_kb(message.from_user.id, amount, currency)
     )
 
@@ -340,6 +341,13 @@ async def confirm_topup(callback: types.CallbackQuery):
         await callback.answer("Ошибка данных", show_alert=True)
         return
 
+    # Update username if needed
+    cur.execute("SELECT username FROM users WHERE user_telegram_id = ?", (uid,))
+    row = cur.fetchone()
+    if row is None:
+        cur.execute("INSERT INTO users (user_telegram_id) VALUES (?)", (uid,))
+        conn.commit()
+
     if currency == "AUR":
         cur.execute(
             "UPDATE users SET aur_balance = aur_balance + ? WHERE user_telegram_id = ?",
@@ -350,18 +358,6 @@ async def confirm_topup(callback: types.CallbackQuery):
             "UPDATE users SET ton_balance = ton_balance + ? WHERE user_telegram_id = ?",
             (amt, uid)
         )
-    if cur.rowcount == 0:
-        cur.execute("INSERT INTO users (user_telegram_id) VALUES (?)", (uid,))
-        if currency == "AUR":
-            cur.execute(
-                "UPDATE users SET aur_balance = ? WHERE user_telegram_id = ?",
-                (amt, uid)
-            )
-        else:
-            cur.execute(
-                "UPDATE users SET ton_balance = ? WHERE user_telegram_id = ?",
-                (amt, uid)
-            )
     conn.commit()
 
     await bot.send_message(uid, f"✅ Баланс пополнен на {amt} {currency}")
@@ -1105,9 +1101,6 @@ async def fake_web_server():
     print(f"Сервер запущен на порту {port}")
 
 # ──────────────────── ЗАПУСК ────────────────────
-
-# ──────────────────── ЗАПУСК ────────────────────
-
 
 async def main():
     print("Бот запущен")
