@@ -60,6 +60,9 @@ class SetCostTonState(StatesGroup):
 class RestoreListState(StatesGroup):
     waiting_list = State()  # Новый state для ожидания списка
 
+class BroadcastState(StatesGroup):
+    waiting_message = State()
+
 # ──────────────────── БАЗА ДАННЫХ ────────────────────
 
 conn = sqlite3.connect("lottery.db", check_same_thread=False)
@@ -100,6 +103,7 @@ announce_chat_id: int | None = None
 announce_message_id: int | None = None
 timer_task: asyncio.Task | None = None
 five_min_notified = False
+user_remind_tasks = {}  # user_id: asyncio.Task for reminders
 
 # ──────────────────── Антиспам функция ────────────────────
 
@@ -174,7 +178,8 @@ def admin_kb():
         [InlineKeyboardButton(text="💰 Установить стоимость билета AUR", callback_data="set_cost_aur")],
         [InlineKeyboardButton(text="💰 Установить стоимость билета TON", callback_data="set_cost_ton")],
         [InlineKeyboardButton(text="👥 Балансы игроков", callback_data="admin_view_balances")],
-        [InlineKeyboardButton(text="🔄 Восстановить список", callback_data="admin_restore_list")],  # Новая кнопка
+        [InlineKeyboardButton(text="🔄 Восстановить список", callback_data="admin_restore_list")],
+        [InlineKeyboardButton(text="📢 Рассылка", callback_data="admin_broadcast")],  # Новая кнопка
     ])
 
 async def contest_kb():
@@ -190,6 +195,16 @@ def confirm_topup_kb(user_id: int, amount: int, currency: str):
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=f"✅ Подтвердить {amount} {currency}", callback_data=f"confirm_{user_id}_{amount}_{currency}")],
         [InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_{user_id}_{amount}_{currency}")]
+    ])
+
+def buy_button_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎟 Купить билеты", callback_data="buy")]
+    ])
+
+def paid_kb(message_id: int):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Я оплатил", callback_data=f"paid_topup_{message_id}")]
     ])
 
 # ──────────────────── HANDLERS ────────────────────
@@ -226,16 +241,18 @@ async def cmd_start(message: types.Message):
             except Exception as e:
                 print(f"Ошибка уведомления реферера: {e}")
 
-    cur.execute("SELECT is_active, prizes, end_time FROM contest WHERE id = 1")
+    cur.execute("SELECT is_active, prizes, end_time, cost_per_ticket_aur, cost_per_ticket_ton FROM contest WHERE id = 1")
     row = cur.fetchone()
-    is_active, prizes_json, end_time = row if row else (0, '[]', None)
+    is_active, prizes_json, end_time, cost_aur, cost_ton = row if row else (0, '[]', None, DEFAULT_COST_PER_TICKET_AUR, DEFAULT_COST_PER_TICKET_TON)
     prizes = json.loads(prizes_json)
 
     if message.chat.type == "private":
         if user.id == ADMIN_ID:
             await message.answer("👑 Админ-панель", reply_markup=admin_kb())
         else:
-            await message.answer("Добро пожаловать!", reply_markup=user_kb())
+            text = "Добро пожаловать!\n"
+            text += f"Стоимость 1 билета: {cost_aur} AUR / {cost_ton} TON"
+            await message.answer(text, reply_markup=user_kb())
     else:
         if is_active and end_time:
             try:
@@ -287,6 +304,7 @@ async def cb_topup(callback: types.CallbackQuery, state: FSMContext):
         [InlineKeyboardButton(text="🔵 TON", callback_data="topup_ton")],
     ])
     await callback.message.answer("Выберите валюту для пополнения:", reply_markup=kb)
+    await callback.message.delete()  # Удалить меню после нажатия
     await callback.answer()
 
 @dp.callback_query(lambda c: c.data.startswith("topup_"))
@@ -295,6 +313,7 @@ async def process_topup_currency(callback: types.CallbackQuery, state: FSMContex
     await state.update_data(currency=currency)
     await callback.message.answer(f"Введите сумму пополнения в {currency}:")
     await state.set_state(TopUpState.waiting_amount)
+    await callback.message.delete()  # Удалить сообщение с выбором
     await callback.answer()
 
 @dp.message(TopUpState.waiting_amount)
@@ -312,12 +331,17 @@ async def process_topup_amount(message: types.Message, state: FSMContext):
     amount = int(message.text)
     memo = f"{message.from_user.id}_{message.from_user.username or 'no_username'}"
 
-    await message.answer(
-        f"💳 Пополнение на {amount} {currency}\n"
-        f"Кошелёк: <code>{TON_WALLET}</code>\n"
-        f"Memo: <code>{memo}</code>",
-        parse_mode="HTML"
-    )
+    cur.execute("SELECT cost_per_ticket_aur, cost_per_ticket_ton FROM contest WHERE id = 1")
+    row = cur.fetchone()
+    cost_aur, cost_ton = row if row else (DEFAULT_COST_PER_TICKET_AUR, DEFAULT_COST_PER_TICKET_TON)
+    cost = cost_aur if currency == "AUR" else cost_ton
+    max_tickets = int(amount // cost) if cost > 0 else 0
+
+    text = f"💳 Пополнение на {amount} {currency}\n"
+    text += f"На эту сумму можно купить ~{max_tickets} билетов\n"
+    text += f"Кошелёк: <code>{TON_WALLET}</code>\n"
+    text += f"Memo: <code>{memo}</code>"
+    msg = await message.answer(text, parse_mode="HTML", reply_markup=paid_kb(message.message_id))
 
     username = message.from_user.username or f"ID{message.from_user.id}"
     await bot.send_message(
@@ -327,6 +351,11 @@ async def process_topup_amount(message: types.Message, state: FSMContext):
     )
 
     await state.clear()
+
+@dp.callback_query(lambda c: c.data.startswith("paid_topup_"))
+async def paid_topup(callback: types.CallbackQuery):
+    await callback.message.delete()
+    await callback.answer("Сообщение удалено.")
 
 @dp.callback_query(lambda c: c.data.startswith("confirm_"))
 async def confirm_topup(callback: types.CallbackQuery):
@@ -360,9 +389,19 @@ async def confirm_topup(callback: types.CallbackQuery):
         )
     conn.commit()
 
-    await bot.send_message(uid, f"✅ Баланс пополнен на {amt} {currency}")
+    await bot.send_message(uid, f"✅ Баланс пополнен на {amt} {currency}", reply_markup=buy_button_kb())
     await callback.message.edit_text(callback.message.text + "\n\n✅ Подтверждено")
     await callback.answer()
+
+    # Start reminder if contest active and no tickets
+    cur.execute("SELECT is_active FROM contest WHERE id = 1")
+    is_active = cur.fetchone()[0]
+    cur.execute("SELECT tickets FROM users WHERE user_telegram_id = ?", (uid,))
+    tickets = cur.fetchone()[0]
+    if is_active and tickets == 0:
+        if uid in user_remind_tasks and not user_remind_tasks[uid].done():
+            user_remind_tasks[uid].cancel()
+        user_remind_tasks[uid] = asyncio.create_task(remind_user(uid))
 
 @dp.callback_query(lambda c: c.data.startswith("reject_"))
 async def reject_topup(callback: types.CallbackQuery):
@@ -396,6 +435,7 @@ async def start_buy_tickets(callback: types.CallbackQuery, state: FSMContext):
         [InlineKeyboardButton(text="За TON", callback_data="buy_ton")],
     ])
     await callback.message.answer("Выберите валюту для покупки билетов:", reply_markup=kb)
+    await callback.message.delete()  # Удалить предыдущее сообщение
     await callback.answer()
 
 @dp.callback_query(lambda c: c.data.startswith("buy_"))
@@ -429,8 +469,11 @@ async def process_buy_currency(callback: types.CallbackQuery, state: FSMContext)
         row = cur.fetchone()
         cost_per_ticket = row[0] if row else DEFAULT_COST_PER_TICKET_TON
 
-    await callback.message.answer(f"Введите количество билетов для покупки за {currency}:")
+    max_tickets = int(balance // cost_per_ticket) if cost_per_ticket > 0 else 0
+    text = f"Ваш баланс: {balance} {currency}\nМожно купить: {max_tickets} билетов\nВведите количество билетов для покупки за {currency}:"
+    await callback.message.answer(text)
     await state.set_state(BuyTicketsState.waiting_quantity)
+    await callback.message.delete()  # Удалить сообщение с выбором
     await callback.answer()
 
 @dp.message(BuyTicketsState.waiting_quantity)
@@ -511,6 +554,11 @@ async def process_buy_tickets(message: types.Message, state: FSMContext):
     await message.answer(f"🎟 Куплено {quantity} билет(ов) за {cost} {currency}!")
     await state.clear()
 
+    # Cancel reminder if exists
+    if uid in user_remind_tasks and not user_remind_tasks[uid].done():
+        user_remind_tasks[uid].cancel()
+        del user_remind_tasks[uid]
+
 @dp.callback_query(lambda c: c.data == "balance")
 async def balance(callback: types.CallbackQuery):
     if await check_rate_limit_and_ban(callback.from_user.id, "balance"):
@@ -532,6 +580,7 @@ async def balance(callback: types.CallbackQuery):
         await callback.message.answer(f"💰 {aur} AUR | {ton} TON\n🎟 {tik}\nШанс на победу: {win_prob:.2f}%")
     else:
         await callback.message.answer(f"💰 {aur} AUR | {ton} TON\n🎟 {tik}\nШанс на победу: 0% (нет билетов в розыгрыше)")
+    await callback.message.delete()  # Удалить меню
     await callback.answer()
 
 @dp.callback_query(lambda c: c.data == "ref")
@@ -543,6 +592,7 @@ async def ref(callback: types.CallbackQuery):
     await callback.message.answer(
         f"https://t.me/{me.username}?start={callback.from_user.id}"
     )
+    await callback.message.delete()  # Удалить меню
     await callback.answer()
 
 @dp.callback_query(lambda c: c.data == "stats")
@@ -574,11 +624,13 @@ async def stats(callback: types.CallbackQuery):
     text += f"\nВсего билетов: {total_tickets}"
 
     await callback.message.answer(text)
+    await callback.message.delete()  # Удалить меню
     await callback.answer()
 
 @dp.callback_query(lambda c: c.data == "show_links")
 async def show_links(callback: types.CallbackQuery):
     await callback.message.answer("Ссылки для покупки AUR и сообщества:", reply_markup=links_kb())
+    await callback.message.delete()  # Удалить меню
     await callback.answer()
 
 @dp.message(Command("send"))
@@ -704,7 +756,7 @@ async def admin_start(callback: types.CallbackQuery):
     five_min_notified = False
     timer_task = asyncio.create_task(update_timer())
 
-    await notify_all_users("🎉 Конкурс начался! Участвуйте и покупайте билеты.")
+    await notify_all_users("Конкурс начался! Чтобы принять участие, нажмите /start в боте.")
 
     await callback.message.answer("Конкурс запущен!")
     await callback.answer("Запущен")
@@ -926,6 +978,34 @@ async def process_restore_list(message: types.Message, state: FSMContext):
     await message.answer(response)
     await state.clear()
 
+@dp.callback_query(lambda c: c.data == "admin_broadcast")
+async def admin_broadcast(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    await callback.message.answer("Введите сообщение для рассылки всем участникам:")
+    await state.set_state(BroadcastState.waiting_message)
+    await callback.answer()
+
+@dp.message(BroadcastState.waiting_message)
+async def process_broadcast(message: types.Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    broadcast_text = message.text
+    cur.execute("SELECT user_telegram_id FROM users WHERE user_telegram_id != ?", (ADMIN_ID,))
+    users = cur.fetchall()
+    for uid in users:
+        if uid[0]:
+            try:
+                await bot.send_message(uid[0], broadcast_text)
+            except Exception as e:
+                print(f"Ошибка рассылки: {e}")
+
+    await message.answer("Рассылка завершена.")
+    await state.clear()
+
 # ──────────────────── ТАЙМЕР + РОЗЫГРЫШ ────────────────────
 
 async def update_timer():
@@ -1030,6 +1110,12 @@ async def perform_draw(total_tickets):
     conn.commit()
     print("Розыгрыш завершён, билеты и балансы сброшены для пользователей")
 
+    # Cancel all reminders
+    for task in user_remind_tasks.values():
+        if not task.done():
+            task.cancel()
+    user_remind_tasks.clear()
+
 async def get_user_id_by_username(username):
     cur.execute("SELECT user_telegram_id FROM users WHERE username = ?", (username,))
     row = cur.fetchone()
@@ -1063,6 +1149,21 @@ async def send_admin_log():
         text += f"@{username}: {tickets} билетов ({prob:.2f}%)\n"
 
     await bot.send_message(ADMIN_ID, text)
+
+async def remind_user(uid: int):
+    while True:
+        cur.execute("SELECT is_active FROM contest WHERE id = 1")
+        is_active = cur.fetchone()[0]
+        cur.execute("SELECT tickets FROM users WHERE user_telegram_id = ?", (uid,))
+        tickets = cur.fetchone()[0]
+        if not is_active or tickets > 0:
+            break
+        try:
+            await bot.send_message(uid, "Напоминание: купите билеты для участия в конкурсе!", reply_markup=buy_button_kb())
+        except Exception as e:
+            print(f"Ошибка напоминания: {e}")
+            break
+        await asyncio.sleep(600)  # 10 minutes
 
 # ──────────────────── KEEP-ALIVE (self-ping) ────────────────────
 
