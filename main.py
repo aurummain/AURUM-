@@ -91,65 +91,6 @@ CREATE TABLE IF NOT EXISTS contest (
 """)
 cur.execute("INSERT OR IGNORE INTO contest (id, is_active, duration_minutes, cost_per_ticket_aur, cost_per_ticket_ton) VALUES (1, 0, 10, 10000, 1.0)")
 
-# Добавление участников статически
-users_data = [
-    (None, "Server1991", 0, 0.0, 0),
-    (None, "B_C_G", 0, 0.0, 0),
-    (None, "TabakovaAnastasiia1512", 0, 0.0, 50),
-    (None, "MasterOfDill", 40000, 0.0, 4),
-    (None, "diezel3377", 0, 0.0, 0),
-    (483769929, None, 0, 0.0, 20),
-    (None, "Igorcrypthogod", 50000, 0.0, 10),
-    (None, "isklyuchitelniy", 0, 0.0, 0),
-    (834986393, None, 0, 0.0, 1),
-    (None, "SALT1111SNUFF", 0, 0.0, 0),
-    (None, "chachahag", 0, 0.10000000000000009, 34),
-    (None, "Lucky_Charms7", 0, 0.0, 0),
-    (None, "bet_men007", 0, 0.0, 0),
-    (None, "AUR_Dev", 0, 0.0, 0),
-    (None, "GIFTCRAFTSCAM", 0, 0.0, 0),
-    (None, "Superok777As", 0, 1.0, 0),
-    (None, "ChikisTuk", 0, 0.0, 0),
-    (None, "Dilaty", 0, 0.0, 0),
-    (None, "k_linsk", 0, 0.0, 30),
-    (None, "rolik122", 0, 0.0, 0),
-    (None, "omishu", 0, 0.0, 10),
-    (None, "ALI_777tm", 0, 0.0, 0),
-    (None, "izsvg", 0, 0.0, 0),
-    (None, "aurum_hold", 0, 0.0, 7),
-    (None, "KanielVoicE", 0, 0.0, 0),
-    (None, "FORT_ZZ", 0, 0.0, 30),
-    (None, "tradekinggg", 0, 0.0, 103),
-    (None, "MASIH_TEK", 0, 0.0, 0),
-    (None, "Sydyia", 260000, 0.0, 15),
-    (None, "MaleKBeY1", 0, 0.0, 0),
-    (None, "notrealman1", 0, 0.0, 0),
-    (None, "ggs0045", 0, 0.0, 1),
-    (None, "aminkhan7848", 0, 0.0, 0),
-    (None, "Nadal555", 0, 0.0, 0),
-    (None, "MrGpw", 0, 0.0, 0),
-    (None, "LEBEDEV10", 0, 0.0, 0),
-    (8323563478, None, 0, 0.0, 1),
-    (None, "clovertoon", 0, 0.0, 0),
-    (None, "SRhwhwku", 0, 0.0, 30),
-]
-
-for user_data in users_data:
-    user_id, username, aur, ton, tickets = user_data
-    if user_id is None and username is not None:
-        # Если username есть, но user_id нет, вставляем без user_id, но поскольку PRIMARY KEY user_id, нужно иметь user_id.
-        # Проблема: для пользователей с username, но без id, мы не можем вставить без id.
-        # В коде мы предполагаем, что user_id известен или будет добавлен позже.
-        # Чтобы статически добавить, нам нужны реальные user_id для всех.
-        # В списке большинство имеют username, некоторые @ID... - это user_id.
-        # Для простоты, вставляем только тех, у кого есть user_id, а для других предполагаем, что они добавятся при регистрации.
-        if user_id is not None:
-            cur.execute("INSERT OR REPLACE INTO users (user_id, username, aur_balance, ton_balance, tickets) VALUES (?, ?, ?, ?, ?)",
-                        (user_id, username, aur, ton, tickets))
-    else:
-        cur.execute("INSERT OR REPLACE INTO users (user_id, username, aur_balance, ton_balance, tickets) VALUES (?, ?, ?, ?, ?)",
-                    (user_id, username, aur, ton, tickets))
-
 conn.commit()
 
 # ──────────────────── Глобальные переменные ────────────────────
@@ -884,7 +825,7 @@ async def process_restore_list(message: types.Message, state: FSMContext):
         if not line:
             continue
 
-        match = re.match(r'@(.+?):\s*(\d+)\s*AUR,\s*([\d.]+)\s*TON,\s*(\d+)\s*билет(ов|а|)', line)
+        match = re.match(r'@(.+?):\s*(\d+)\s*AUR,\s*([\d.]+)\s*TON,\s*(\d+)\s*билет(ов|а|)?', line)
         if not match:
             skipped.append(line)
             continue
@@ -905,16 +846,30 @@ async def process_restore_list(message: types.Message, state: FSMContext):
                 continue
         else:
             username = username_part
+
+        # Если user_id не указан (для username), пытаемся найти в БД или получить из Telegram
+        if user_id is None:
             cur.execute("SELECT user_id FROM users WHERE username = ?", (username,))
             row = cur.fetchone()
             if row:
                 user_id = row[0]
             else:
-                # Если user_id не найден, вставляем с username, но без user_id - но PRIMARY KEY требует user_id.
-                # Чтобы добавить нового, нам нужно знать user_id.
-                # Для новых пользователей мы можем пропустить или добавить с placeholder, но лучше пропустить если нет id.
-                skipped.append(line)
-                continue
+                try:
+                    chat = await bot.get_chat(f'@{username}')
+                    user_id = chat.id
+                except Exception as e:
+                    print(f"Ошибка получения user_id для {username}: {e}")
+                    skipped.append(line)
+                    continue
+
+        # Если username не указан (для ID), получаем из Telegram
+        if username is None and user_id is not None:
+            try:
+                chat = await bot.get_chat(user_id)
+                username = chat.username
+            except Exception as e:
+                print(f"Ошибка получения username для ID {user_id}: {e}")
+                # Можно продолжить без username
 
         if user_id is None:
             skipped.append(line)
