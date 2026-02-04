@@ -69,7 +69,7 @@ cur.execute("""
 CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_telegram_id INTEGER UNIQUE,
-    username TEXT UNIQUE,
+    username TEXT,
     aur_balance INTEGER DEFAULT 0,
     ton_balance REAL DEFAULT 0.0,
     tickets INTEGER DEFAULT 0,
@@ -208,18 +208,23 @@ async def cmd_start(message: types.Message):
     existing = cur.fetchone()
 
     if not existing:
-        cur.execute(
-            "INSERT INTO users (user_telegram_id, username, referrer_id) VALUES (?, ?, ?)",
-            (user.id, user.username, referrer_id)
-        )
+        try:
+            cur.execute(
+                "INSERT INTO users (user_telegram_id, username, referrer_id) VALUES (?, ?, ?)",
+                (user.id, user.username, referrer_id)
+            )
+        except sqlite3.IntegrityError:
+            # If conflict, update
+            cur.execute(
+                "UPDATE users SET username = ?, referrer_id = ? WHERE user_telegram_id = ?",
+                (user.username, referrer_id, user.id)
+            )
         conn.commit()
         if referrer_id:
             try:
                 await bot.send_message(referrer_id, f"У вас новый реферал: @{user.username or f'ID{user.id}'}")
             except Exception as e:
                 print(f"Ошибка уведомления реферера: {e}")
-    elif referrer_id and existing[0] != referrer_id:
-        pass
 
     cur.execute("SELECT is_active, prizes, end_time FROM contest WHERE id = 1")
     row = cur.fetchone()
@@ -345,6 +350,18 @@ async def confirm_topup(callback: types.CallbackQuery):
             "UPDATE users SET ton_balance = ton_balance + ? WHERE user_telegram_id = ?",
             (amt, uid)
         )
+    if cur.rowcount == 0:
+        cur.execute("INSERT INTO users (user_telegram_id) VALUES (?)", (uid,))
+        if currency == "AUR":
+            cur.execute(
+                "UPDATE users SET aur_balance = ? WHERE user_telegram_id = ?",
+                (amt, uid)
+            )
+        else:
+            cur.execute(
+                "UPDATE users SET ton_balance = ? WHERE user_telegram_id = ?",
+                (amt, uid)
+            )
     conn.commit()
 
     await bot.send_message(uid, f"✅ Баланс пополнен на {amt} {currency}")
@@ -393,19 +410,28 @@ async def process_buy_currency(callback: types.CallbackQuery, state: FSMContext)
     uid = callback.from_user.id
     if currency == "AUR":
         cur.execute("SELECT aur_balance FROM users WHERE user_telegram_id = ?", (uid,))
-        balance = cur.fetchone()[0] or 0
+        row = cur.fetchone()
+        if row is None:
+            cur.execute("INSERT INTO users (user_telegram_id) VALUES (?)", (uid,))
+            conn.commit()
+            balance = 0
+        else:
+            balance = row[0]
         cur.execute("SELECT cost_per_ticket_aur FROM contest WHERE id = 1")
-        cost_per_ticket = cur.fetchone()[0]
+        row = cur.fetchone()
+        cost_per_ticket = row[0] if row else DEFAULT_COST_PER_TICKET_AUR
     else:
         cur.execute("SELECT ton_balance FROM users WHERE user_telegram_id = ?", (uid,))
-        balance = cur.fetchone()[0] or 0
+        row = cur.fetchone()
+        if row is None:
+            cur.execute("INSERT INTO users (user_telegram_id) VALUES (?)", (uid,))
+            conn.commit()
+            balance = 0.0
+        else:
+            balance = row[0]
         cur.execute("SELECT cost_per_ticket_ton FROM contest WHERE id = 1")
-        cost_per_ticket = cur.fetchone()[0]
-
-    if balance < cost_per_ticket:
-        await callback.answer(f"Недостаточно средств для покупки хотя бы одного билета (стоимость: {cost_per_ticket} {currency})", show_alert=True)
-        await state.clear()
-        return
+        row = cur.fetchone()
+        cost_per_ticket = row[0] if row else DEFAULT_COST_PER_TICKET_TON
 
     await callback.message.answer(f"Введите количество билетов для покупки за {currency}:")
     await state.set_state(BuyTicketsState.waiting_quantity)
@@ -426,21 +452,25 @@ async def process_buy_tickets(message: types.Message, state: FSMContext):
     quantity = int(message.text)
     if currency == "AUR":
         cur.execute("SELECT cost_per_ticket_aur FROM contest WHERE id = 1")
-        cost_per_ticket = cur.fetchone()[0]
+        row = cur.fetchone()
+        cost_per_ticket = row[0] if row else DEFAULT_COST_PER_TICKET_AUR
     else:
         cur.execute("SELECT cost_per_ticket_ton FROM contest WHERE id = 1")
-        cost_per_ticket = cur.fetchone()[0]
+        row = cur.fetchone()
+        cost_per_ticket = row[0] if row else DEFAULT_COST_PER_TICKET_TON
     cost = quantity * cost_per_ticket
     uid = message.from_user.id
-    if currency == "AUR":
-        cur.execute("SELECT aur_balance, referrer_id, rewarded_referrer FROM users WHERE user_telegram_id = ?", (uid,))
-        row = cur.fetchone()
-        balance = row[0]
+    cur.execute("SELECT aur_balance, ton_balance, referrer_id, rewarded_referrer FROM users WHERE user_telegram_id = ?", (uid,))
+    row = cur.fetchone()
+    if row is None:
+        cur.execute("INSERT INTO users (user_telegram_id) VALUES (?)", (uid,))
+        conn.commit()
+        balance = 0 if currency == "AUR" else 0.0
+        referrer_id = None
+        rewarded = 0
     else:
-        cur.execute("SELECT ton_balance, referrer_id, rewarded_referrer FROM users WHERE user_telegram_id = ?", (uid,))
-        row = cur.fetchone()
-        balance = row[0]
-    referrer_id, rewarded = row[1], row[2]
+        balance = row[0] if currency == "AUR" else row[1]
+        referrer_id, rewarded = row[2], row[3]
 
     if balance < cost:
         await message.answer(f"Недостаточно средств. Требуется {cost} {currency}, доступно {balance} {currency}")
@@ -490,9 +520,15 @@ async def balance(callback: types.CallbackQuery):
     if await check_rate_limit_and_ban(callback.from_user.id, "balance"):
         await callback.answer("Вы заблокированы за спам.", show_alert=True)
         return
-    cur.execute("SELECT aur_balance, ton_balance, tickets FROM users WHERE user_telegram_id = ?", (callback.from_user.id,))
+    uid = callback.from_user.id
+    cur.execute("SELECT aur_balance, ton_balance, tickets FROM users WHERE user_telegram_id = ?", (uid,))
     row = cur.fetchone()
-    aur, ton, tik = row[0:3] if row else (0, 0.0, 0)
+    if row is None:
+        cur.execute("INSERT INTO users (user_telegram_id) VALUES (?)", (uid,))
+        conn.commit()
+        aur, ton, tik = 0, 0.0, 0
+    else:
+        aur, ton, tik = row
     cur.execute("SELECT SUM(tickets) FROM users")
     total_tickets = cur.fetchone()[0] or 0
     if total_tickets > 0:
@@ -554,13 +590,11 @@ async def cmd_send(message: types.Message):
     if await check_rate_limit_and_ban(message.from_user.id, "send"):
         return
     sender_id = message.from_user.id
-    cur.execute("SELECT tickets, id FROM users WHERE user_telegram_id = ?", (sender_id,))
+    cur.execute("SELECT tickets FROM users WHERE user_telegram_id = ?", (sender_id,))
     sender_row = cur.fetchone()
     if not sender_row or sender_row[0] == 0:
         await message.reply("У вас нет билетов для отправки.")
         return
-
-    sender_internal_id = sender_row[1]
 
     if message.reply_to_message:
         recipient_id = message.reply_to_message.from_user.id
@@ -572,12 +606,6 @@ async def cmd_send(message: types.Message):
             await message.reply("Формат: /send <количество> (в ответ на сообщение)")
             return
         quantity = int(args[0])
-        cur.execute("SELECT id FROM users WHERE user_telegram_id = ?", (recipient_id,))
-        recipient_row = cur.fetchone()
-        if not recipient_row:
-            await message.reply("Получатель не найден.")
-            return
-        recipient_internal_id = recipient_row[0]
     else:
         args = message.text.split()[1:]
         if len(args) != 2 or not args[0].startswith('@') or not args[1].isdigit():
@@ -585,41 +613,40 @@ async def cmd_send(message: types.Message):
             return
         username = args[0][1:]
         quantity = int(args[1])
-        cur.execute("SELECT id FROM users WHERE username = ?", (username,))
+        cur.execute("SELECT user_telegram_id FROM users WHERE username = ?", (username,))
         recipient_row = cur.fetchone()
         if not recipient_row:
             await message.reply("Пользователь не найден.")
             return
-        recipient_internal_id = recipient_row[0]
-        recipient_id = None  # For notification, need to get user_telegram_id
-        cur.execute("SELECT user_telegram_id FROM users WHERE id = ?", (recipient_internal_id,))
-        recipient_id = cur.fetchone()[0]
+        recipient_id = recipient_row[0]
+        if recipient_id == sender_id:
+            await message.reply("Нельзя отправить билеты себе.")
+            return
 
     if quantity <= 0:
         await message.reply("Количество должно быть положительным.")
         return
 
-    sender_tickets = sender_row[0]
+    cur.execute("SELECT tickets FROM users WHERE user_telegram_id = ?", (sender_id,))
+    sender_tickets = cur.fetchone()[0]
     if quantity > sender_tickets:
         await message.reply(f"У вас только {sender_tickets} билетов.")
         return
 
-    cur.execute("UPDATE users SET tickets = tickets - ? WHERE id = ?", (quantity, sender_internal_id))
-    cur.execute("UPDATE users SET tickets = tickets + ? WHERE id = ?", (quantity, recipient_internal_id))
+    cur.execute("INSERT OR IGNORE INTO users (user_telegram_id) VALUES (?)", (recipient_id,))
+
+    cur.execute("UPDATE users SET tickets = tickets - ? WHERE user_telegram_id = ?", (quantity, sender_id))
+    cur.execute("UPDATE users SET tickets = tickets + ? WHERE user_telegram_id = ?", (quantity, recipient_id))
     conn.commit()
 
     sender_username = message.from_user.username or f"ID{sender_id}"
-    cur.execute("SELECT username, user_telegram_id FROM users WHERE id = ?", (recipient_internal_id,))
-    recip_row = cur.fetchone()
-    recipient_username = recip_row[0] or f"ID{recip_row[1] if recip_row[1] else 'unknown'}"
-    recipient_id = recip_row[1]
+    recipient_username = (await bot.get_chat(recipient_id)).username or f"ID{recipient_id}"
 
     await message.reply(f"✅ Отправлено {quantity} билет(ов) пользователю @{recipient_username}")
-    if recipient_id:
-        try:
-            await bot.send_message(recipient_id, f"🎟 Получено {quantity} билет(ов) от @{sender_username}")
-        except:
-            pass
+    try:
+        await bot.send_message(recipient_id, f"🎟 Получено {quantity} билет(ов) от @{sender_username}")
+    except:
+        pass
 
     if announce_chat_id:
         cur.execute("SELECT SUM(tickets) FROM users")
@@ -809,7 +836,7 @@ async def admin_view_balances(callback: types.CallbackQuery):
     if not rows:
         await callback.message.answer("Нет игроков")
     else:
-        text = "Балансы:\n" + "\n".join([f"@{r[1] or f'ID{r[0]}'}: {r[2]} AUR, {r[3]} TON, {r[4]} билетов" for r in rows if r[0] or r[1]])
+        text = "Балансы:\n" + "\n".join([f"@{r[1] or f'ID{r[0]}'}: {r[2]} AUR, {r[3]} TON, {r[4]} билетов" for r in rows])
         await callback.message.answer(text)
     await callback.answer()
 
@@ -856,21 +883,29 @@ async def process_restore_list(message: types.Message, state: FSMContext):
         else:
             username = username_part
 
-        # Пытаемся найти существующую запись
+        # Try to get user_telegram_id if not provided
+        if user_telegram_id is None and username is not None:
+            try:
+                chat = await bot.get_chat(f'@{username}')
+                user_telegram_id = chat.id
+            except Exception as e:
+                print(f"Ошибка получения user_telegram_id для {username}: {e}")
+
+        # Find existing record
         existing_id = None
         if user_telegram_id is not None:
             cur.execute("SELECT id FROM users WHERE user_telegram_id = ?", (user_telegram_id,))
             row = cur.fetchone()
             if row:
                 existing_id = row[0]
-        elif username is not None:
+        if existing_id is None and username is not None:
             cur.execute("SELECT id FROM users WHERE username = ?", (username,))
             row = cur.fetchone()
             if row:
                 existing_id = row[0]
 
         if existing_id is not None:
-            # Обновляем существующую запись
+            # Update existing
             cur.execute("""
                 UPDATE users SET aur_balance = ?, ton_balance = ?, tickets = ?,
                 user_telegram_id = COALESCE(?, user_telegram_id),
@@ -878,7 +913,7 @@ async def process_restore_list(message: types.Message, state: FSMContext):
                 WHERE id = ?
             """, (aur, ton, tickets, user_telegram_id, username, existing_id))
         else:
-            # Вставляем новую запись
+            # Insert new
             cur.execute("""
                 INSERT INTO users (user_telegram_id, username, aur_balance, ton_balance, tickets)
                 VALUES (?, ?, ?, ?, ?)
@@ -967,11 +1002,10 @@ async def perform_draw(total_tickets):
         for wid in winners_ids:
             cur.execute("SELECT username, user_telegram_id FROM users WHERE id = ?", (wid,))
             row = cur.fetchone()
-            w_username, w_telegram_id = row
-            if w_username:
-                winners.append((w_username, w_telegram_id))
+            if row:
+                winners.append(row)
 
-    winners_text = ", ".join([f"@{w[0]}" for w in winners]) if winners else "Нет победителей"
+    winners_text = ", ".join([f"@{w[0]}" for w in winners if w[0]]) if winners else "Нет победителей"
     text = f"🎉 Конкурс завершён!\nПобедители: {winners_text}\nПоздравляем!"
 
     await bot.edit_message_text(
@@ -983,7 +1017,8 @@ async def perform_draw(total_tickets):
     # Редактировать сообщения призов
     for i, mid in enumerate(prize_message_ids):
         if i < len(winners):
-            winner_username, winner_telegram_id = winners[i]
+            winner = winners[i]
+            winner_username, winner_telegram_id = winner
             winner_tickets, winner_prob = await get_winner_stats(winner_username, total_tickets)
             edit_text = f"{i+1}й приз: {prizes[i]} победил @{winner_username} ({winner_tickets} билетов, {winner_prob:.2f}%)"
             await bot.edit_message_text(edit_text, chat_id=announce_chat_id, message_id=mid)
@@ -995,9 +1030,9 @@ async def perform_draw(total_tickets):
     await send_admin_log()
 
     cur.execute("UPDATE contest SET is_active = 0, end_time = NULL WHERE id = 1")
-    cur.execute("UPDATE users SET tickets = 0")
+    cur.execute("UPDATE users SET tickets = 0, aur_balance = 0, ton_balance = 0.0, rewarded_referrer = 0 WHERE user_telegram_id != ?", (ADMIN_ID,))
     conn.commit()
-    print("Розыгрыш завершён, билеты сброшены")
+    print("Розыгрыш завершён, билеты и балансы сброшены для пользователей")
 
 async def get_user_id_by_username(username):
     cur.execute("SELECT user_telegram_id FROM users WHERE username = ?", (username,))
@@ -1011,13 +1046,14 @@ async def get_winner_stats(username, total_tickets):
     return tickets, prob
 
 async def notify_all_users(text):
-    cur.execute("SELECT user_telegram_id FROM users WHERE user_telegram_id IS NOT NULL")
+    cur.execute("SELECT user_telegram_id FROM users")
     users = cur.fetchall()
     for uid in users:
-        try:
-            await bot.send_message(uid[0], text)
-        except Exception as e:
-            print(f"Ошибка рассылки: {e}")
+        if uid[0]:
+            try:
+                await bot.send_message(uid[0], text)
+            except Exception as e:
+                print(f"Ошибка рассылки: {e}")
 
 async def send_admin_log():
     cur.execute("SELECT username, tickets FROM users WHERE tickets > 0 AND username IS NOT NULL")
@@ -1069,6 +1105,10 @@ async def fake_web_server():
     print(f"Сервер запущен на порту {port}")
 
 # ──────────────────── ЗАПУСК ────────────────────
+
+# ──────────────────── ЗАПУСК ────────────────────
+
+
 async def main():
     print("Бот запущен")
     await asyncio.gather(
