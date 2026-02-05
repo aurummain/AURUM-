@@ -178,6 +178,7 @@ def admin_kb():
         [InlineKeyboardButton(text="💰 Установить стоимость билета AUR", callback_data="set_cost_aur")],
         [InlineKeyboardButton(text="💰 Установить стоимость билета TON", callback_data="set_cost_ton")],
         [InlineKeyboardButton(text="👥 Балансы игроков", callback_data="admin_view_balances")],
+        [InlineKeyboardButton(text="🗑 Сбросить все балансы", callback_data="admin_reset_balances")],  # Новая кнопка для сброса
         [InlineKeyboardButton(text="🔄 Восстановить список", callback_data="admin_restore_list")],
         [InlineKeyboardButton(text="📢 Рассылка", callback_data="admin_broadcast")],  # Новая кнопка
     ])
@@ -304,7 +305,10 @@ async def cb_topup(callback: types.CallbackQuery, state: FSMContext):
         [InlineKeyboardButton(text="🔵 TON", callback_data="topup_ton")],
     ])
     await callback.message.answer("Выберите валюту для пополнения:", reply_markup=kb)
-    await callback.message.delete()  # Удалить меню после нажатия
+    try:
+        await callback.message.delete()  # Удалить меню после нажатия
+    except:
+        pass  # Игнорируем ошибку удаления, если сообщение уже удалено
     await callback.answer()
 
 @dp.callback_query(lambda c: c.data.startswith("topup_"))
@@ -313,7 +317,10 @@ async def process_topup_currency(callback: types.CallbackQuery, state: FSMContex
     await state.update_data(currency=currency)
     await callback.message.answer(f"Введите сумму пополнения в {currency}:")
     await state.set_state(TopUpState.waiting_amount)
-    await callback.message.delete()  # Удалить сообщение с выбором
+    try:
+        await callback.message.delete()  # Удалить сообщение с выбором
+    except:
+        pass  # Игнорируем ошибку удаления
     await callback.answer()
 
 @dp.message(TopUpState.waiting_amount)
@@ -435,7 +442,10 @@ async def start_buy_tickets(callback: types.CallbackQuery, state: FSMContext):
         [InlineKeyboardButton(text="За TON", callback_data="buy_ton")],
     ])
     await callback.message.answer("Выберите валюту для покупки билетов:", reply_markup=kb)
-    await callback.message.delete()  # Удалить предыдущее сообщение
+    try:
+        await callback.message.delete()  # Удалить предыдущее сообщение
+    except:
+        pass  # Игнорируем ошибку удаления
     await callback.answer()
 
 @dp.callback_query(lambda c: c.data.startswith("buy_"))
@@ -452,7 +462,7 @@ async def process_buy_currency(callback: types.CallbackQuery, state: FSMContext)
             conn.commit()
             balance = 0
         else:
-            balance = row[0]
+            balance = row[0] if row else 0
         cur.execute("SELECT cost_per_ticket_aur FROM contest WHERE id = 1")
         row = cur.fetchone()
         cost_per_ticket = row[0] if row else DEFAULT_COST_PER_TICKET_AUR
@@ -464,7 +474,7 @@ async def process_buy_currency(callback: types.CallbackQuery, state: FSMContext)
             conn.commit()
             balance = 0.0
         else:
-            balance = row[0]
+            balance = row[0] if row else 0.0
         cur.execute("SELECT cost_per_ticket_ton FROM contest WHERE id = 1")
         row = cur.fetchone()
         cost_per_ticket = row[0] if row else DEFAULT_COST_PER_TICKET_TON
@@ -473,7 +483,10 @@ async def process_buy_currency(callback: types.CallbackQuery, state: FSMContext)
     text = f"Ваш баланс: {balance} {currency}\nМожно купить: {max_tickets} билетов\nВведите количество билетов для покупки за {currency}:"
     await callback.message.answer(text)
     await state.set_state(BuyTicketsState.waiting_quantity)
-    await callback.message.delete()  # Удалить сообщение с выбором
+    try:
+        await callback.message.delete()  # Удалить сообщение с выбором
+    except:
+        pass  # Игнорируем ошибку удаления
     await callback.answer()
 
 @dp.message(BuyTicketsState.waiting_quantity)
@@ -580,7 +593,10 @@ async def balance(callback: types.CallbackQuery):
         await callback.message.answer(f"💰 {aur} AUR | {ton} TON\n🎟 {tik}\nШанс на победу: {win_prob:.2f}%")
     else:
         await callback.message.answer(f"💰 {aur} AUR | {ton} TON\n🎟 {tik}\nШанс на победу: 0% (нет билетов в розыгрыше)")
-    await callback.message.delete()  # Удалить меню
+    try:
+        await callback.message.delete()  # Удалить меню
+    except:
+        pass  # Игнорируем ошибку удаления
     await callback.answer()
 
 @dp.callback_query(lambda c: c.data == "ref")
@@ -592,7 +608,10 @@ async def ref(callback: types.CallbackQuery):
     await callback.message.answer(
         f"https://t.me/{me.username}?start={callback.from_user.id}"
     )
-    await callback.message.delete()  # Удалить меню
+    try:
+        await callback.message.delete()  # Удалить меню
+    except:
+        pass  # Игнорируем ошибку удаления
     await callback.answer()
 
 @dp.callback_query(lambda c: c.data == "stats")
@@ -624,13 +643,19 @@ async def stats(callback: types.CallbackQuery):
     text += f"\nВсего билетов: {total_tickets}"
 
     await callback.message.answer(text)
-    await callback.message.delete()  # Удалить меню
+    try:
+        await callback.message.delete()  # Удалить меню
+    except:
+        pass  # Игнорируем ошибку удаления
     await callback.answer()
 
 @dp.callback_query(lambda c: c.data == "show_links")
 async def show_links(callback: types.CallbackQuery):
     await callback.message.answer("Ссылки для покупки AUR и сообщества:", reply_markup=links_kb())
-    await callback.message.delete()  # Удалить меню
+    try:
+        await callback.message.delete()  # Удалить меню
+    except:
+        pass  # Игнорируем ошибку удаления
     await callback.answer()
 
 @dp.message(Command("send"))
@@ -721,6 +746,11 @@ async def admin_start(callback: types.CallbackQuery):
         await callback.message.answer("Сначала /addchat в нужной группе")
         await callback.answer()
         return
+
+    # Сброс всех балансов и билетов перед запуском конкурса
+    cur.execute("UPDATE users SET tickets = 0, aur_balance = 0, ton_balance = 0.0, rewarded_referrer = 0 WHERE user_telegram_id != ?", (ADMIN_ID,))
+    conn.commit()
+    await callback.message.answer("Все балансы и билеты сброшены перед запуском конкурса.")
 
     cur.execute("SELECT prizes, duration_minutes FROM contest WHERE id = 1")
     row = cur.fetchone()
@@ -886,6 +916,17 @@ async def admin_view_balances(callback: types.CallbackQuery):
     else:
         text = "Балансы:\n" + "\n".join([f"@{r[1] or f'ID{r[0]}'}: {r[2]} AUR, {r[3]} TON, {r[4]} билетов" for r in rows])
         await callback.message.answer(text)
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data == "admin_reset_balances")
+async def admin_reset_balances(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    cur.execute("UPDATE users SET tickets = 0, aur_balance = 0, ton_balance = 0.0, rewarded_referrer = 0 WHERE user_telegram_id != ?", (ADMIN_ID,))
+    conn.commit()
+    await callback.message.answer("Все балансы и билеты сброшены для всех пользователей (кроме админа).")
     await callback.answer()
 
 @dp.callback_query(lambda c: c.data == "admin_restore_list")
@@ -1081,7 +1122,7 @@ async def perform_draw(total_tickets):
             if row:
                 winners.append(row)
 
-    winners_text = ", ".join([f"@{w[0]}" for w in winners if w[0]]) if winners else "Нет победителей"
+    winners_text = ", ".join([f"@{w[0] or f'ID{w[1]}'}" for w in winners]) if winners else "Нет победителей"
     text = f"🎉 Конкурс завершён!\nПобедители: {winners_text}\nПоздравляем!"
 
     await bot.edit_message_text(
@@ -1095,8 +1136,8 @@ async def perform_draw(total_tickets):
         if i < len(winners):
             winner = winners[i]
             winner_username, winner_telegram_id = winner
-            winner_tickets, winner_prob = await get_winner_stats(winner_username, total_tickets)
-            edit_text = f"{i+1}й приз: {prizes[i]} победил @{winner_username} ({winner_tickets} билетов, {winner_prob:.2f}%)"
+            winner_tickets, winner_prob = await get_winner_stats(winner_username, winner_telegram_id, total_tickets)
+            edit_text = f"{i+1}й приз: {prizes[i]} победил @{winner_username or f'ID{winner_telegram_id}'} ({winner_tickets} билетов, {winner_prob:.2f}%)"
             await bot.edit_message_text(edit_text, chat_id=announce_chat_id, message_id=mid)
             if winner_telegram_id:
                 await bot.send_message(winner_telegram_id, f"🎉 Вы выиграли {prizes[i]}! Напишите админу.")
@@ -1116,14 +1157,18 @@ async def perform_draw(total_tickets):
             task.cancel()
     user_remind_tasks.clear()
 
-async def get_user_id_by_username(username):
-    cur.execute("SELECT user_telegram_id FROM users WHERE username = ?", (username,))
-    row = cur.fetchone()
-    return row[0] if row else None
-
-async def get_winner_stats(username, total_tickets):
-    cur.execute("SELECT tickets FROM users WHERE username = ?", (username,))
-    tickets = cur.fetchone()[0] or 0
+async def get_winner_stats(username, telegram_id, total_tickets):
+    tickets = 0
+    if username:
+        cur.execute("SELECT tickets FROM users WHERE username = ?", (username,))
+        row = cur.fetchone()
+        if row:
+            tickets = row[0] or 0
+    if tickets == 0 and telegram_id:
+        cur.execute("SELECT tickets FROM users WHERE user_telegram_id = ?", (telegram_id,))
+        row = cur.fetchone()
+        if row:
+            tickets = row[0] or 0
     prob = (tickets / total_tickets * 100) if total_tickets > 0 else 0
     return tickets, prob
 
