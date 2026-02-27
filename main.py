@@ -5,6 +5,7 @@ import random
 import json
 import re  # Для парсинга строк списка
 from datetime import datetime, timedelta, timezone
+import string  # Для генерации кодов ваучеров
 
 import aiohttp
 from aiohttp import web
@@ -16,17 +17,21 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 # ──────────────────── НАСТРОЙКИ ────────────────────
 
-BOT_TOKEN = "8274963448:AAE06C6g-0A7aWoPMI51zos3IIsevhxDwSE"
+BOT_TOKEN = "8505295400:AAF6xOuPHUihIdlrkWorG_ndXcnn53Ps3O8"
 ADMIN_ID = 1333099097
 TON_WALLET = "UQBJNtgVfE-x7-K1uY_EhW1rdvGKhq5gM244fX89VF0bof7R"
 
 DEFAULT_COST_PER_TICKET_AUR = 10000
-DEFAULT_COST_PER_TICKET_TON = 1
+DEFAULT_COST_PER_TICKET_TON = 0.3
 DEFAULT_CONTEST_MINUTES = 10
 TIMER_UPDATE_INTERVAL = 15
 RATE_LIMIT_WINDOW = 60  # Окно в секундах (1 минута)
 RATE_LIMIT_COUNT = 5  # Макс команд за окно
 BAN_DURATION_MINUTES = 5  # Длительность блока
+
+# Новые настройки для сжигания AUR
+BURN_AUR_PER_MINUTE = 10000  # Сколько AUR нужно сжечь для сокращения таймера на 1 минуту
+BONUS_TICKETS_PER_BURN = 1  # Сколько билетов раздать случайным участникам за каждую минуту сокращения
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -35,11 +40,19 @@ dp = Dispatcher()
 rate_limit_dict = {}  # user_id: {command: [timestamps]}
 ban_dict = {}  # user_id: unban_time
 
+# Временный словарь для заявок на пополнение
+pending_topups = {}  # message_id: {'user_id': int, 'amount': float, 'currency': str, 'memo': str}
+
 # ──────────────────── FSM ────────────────────
 
 class TopUpState(StatesGroup):
     waiting_currency = State()
     waiting_amount = State()
+
+class WithdrawState(StatesGroup):
+    waiting_currency = State()
+    waiting_amount = State()
+    waiting_address = State()
 
 class SetPrizesState(StatesGroup):
     waiting_prizes = State()
@@ -63,6 +76,12 @@ class RestoreListState(StatesGroup):
 class BroadcastState(StatesGroup):
     waiting_message = State()
 
+class CreateVoucherState(StatesGroup):
+    waiting_quantity = State()
+
+class BurnAurState(StatesGroup):
+    waiting_amount = State()
+
 # ──────────────────── БАЗА ДАННЫХ ────────────────────
 
 conn = sqlite3.connect("lottery.db", check_same_thread=False)
@@ -72,7 +91,7 @@ cur.execute("""
 CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_telegram_id INTEGER UNIQUE,
-    username TEXT,
+    username TEXT UNIQUE,
     aur_balance INTEGER DEFAULT 0,
     ton_balance REAL DEFAULT 0.0,
     tickets INTEGER DEFAULT 0,
@@ -94,6 +113,34 @@ CREATE TABLE IF NOT EXISTS contest (
 )
 """)
 cur.execute("INSERT OR IGNORE INTO contest (id, is_active, duration_minutes, cost_per_ticket_aur, cost_per_ticket_ton) VALUES (1, 0, 10, 10000, 1.0)")
+
+cur.execute("""
+CREATE TABLE IF NOT EXISTS vouchers (
+    code TEXT PRIMARY KEY,
+    creator_telegram_id INTEGER,
+    remaining_tickets INTEGER,
+    used_by_telegram_id INTEGER DEFAULT NULL
+)
+""")
+
+cur.execute("""
+CREATE TABLE IF NOT EXISTS voucher_usages (
+    code TEXT,
+    user_telegram_id INTEGER,
+    PRIMARY KEY (code, user_telegram_id)
+)
+""")
+
+cur.execute("""
+CREATE TABLE IF NOT EXISTS withdraw_requests (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    amount REAL,
+    currency TEXT,
+    address TEXT,
+    status TEXT DEFAULT 'pending'
+)
+""")
 
 conn.commit()
 
@@ -158,6 +205,9 @@ def user_kb():
         [InlineKeyboardButton(text="🤝 Реф. ссылка", callback_data="ref")],
         [InlineKeyboardButton(text="📈 Статистика шансов", callback_data="stats")],
         [InlineKeyboardButton(text="🔗 Buy AUR & links", callback_data="show_links")],
+        [InlineKeyboardButton(text="🎫 Создать ваучер", callback_data="create_voucher")],
+        [InlineKeyboardButton(text="🔥 Сжечь AUR для таймера", callback_data="burn_aur")],
+        [InlineKeyboardButton(text="💸 Вывод", callback_data="withdraw")],
     ])
 
 def links_kb():
@@ -192,7 +242,7 @@ async def contest_kb():
         )],
     ])
 
-def confirm_topup_kb(user_id: int, amount: int, currency: str):
+def confirm_topup_kb(user_id: int, amount: float, currency: str):
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=f"✅ Подтвердить {amount} {currency}", callback_data=f"confirm_{user_id}_{amount}_{currency}")],
         [InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_{user_id}_{amount}_{currency}")]
@@ -203,9 +253,29 @@ def buy_button_kb():
         [InlineKeyboardButton(text="🎟 Купить билеты", callback_data="buy")]
     ])
 
-def paid_kb(message_id: int):
+def topup_kb(message_id: int):
     return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📋 Скопировать адрес", callback_data=f"copy_wallet_{message_id}")],
+        [InlineKeyboardButton(text="📋 Скопировать memo", callback_data=f"copy_memo_{message_id}")],
         [InlineKeyboardButton(text="✅ Я оплатил", callback_data=f"paid_topup_{message_id}")]
+    ])
+
+def withdraw_kb(withdraw_id: int):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Я указал", callback_data=f"paid_withdraw_{withdraw_id}")]
+    ])
+
+def confirm_withdraw_kb(withdraw_id: int, amount: float, currency: str):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📋 Скопировать адрес", callback_data=f"copy_address_{withdraw_id}")],
+        [InlineKeyboardButton(text="📋 Скопировать сумму", callback_data=f"copy_amount_{withdraw_id}")],
+        [InlineKeyboardButton(text=f"✅ Подтвердить {amount} {currency}", callback_data=f"confirm_withdraw_{withdraw_id}")],
+        [InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_withdraw_{withdraw_id}")]
+    ])
+
+def voucher_kb(voucher_link: str):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Получить билет", url=voucher_link)]
     ])
 
 # ──────────────────── HANDLERS ────────────────────
@@ -217,13 +287,26 @@ async def cmd_start(message: types.Message):
         return
 
     args = message.text.split()
-    referrer_id = int(args[1]) if len(args) > 1 and args[1].isdigit() else None
+    referrer_id = None
+    voucher_code = None
+    if len(args) > 1:
+        param = args[1]
+        if len(param) == 8 and all(c in string.ascii_uppercase + string.digits for c in param):
+            voucher_code = param
+        elif param.isdigit():
+            referrer_id = int(param)
 
     user = message.from_user
+    if user.username is None:
+        await message.answer("Чтобы участвовать в боте, у вас должен быть username в Telegram. Перейдите в настройки и установите его (например, @yourname).")
+        return
+
     cur.execute("SELECT referrer_id FROM users WHERE user_telegram_id = ?", (user.id,))
     existing = cur.fetchone()
 
     if not existing:
+        if referrer_id == user.id:
+            referrer_id = None
         try:
             cur.execute(
                 "INSERT INTO users (user_telegram_id, username, referrer_id) VALUES (?, ?, ?)",
@@ -238,9 +321,47 @@ async def cmd_start(message: types.Message):
         conn.commit()
         if referrer_id:
             try:
-                await bot.send_message(referrer_id, f"У вас новый реферал: @{user.username or f'ID{user.id}'}")
+                await bot.send_message(referrer_id, f"У вас новый реферал: @{user.username}")
             except Exception as e:
                 print(f"Ошибка уведомления реферера: {e}")
+
+    # Если это ваучер, активировать
+    if voucher_code:
+        cur.execute("SELECT creator_telegram_id, remaining_tickets FROM vouchers WHERE code = ?", (voucher_code,))
+        row = cur.fetchone()
+        if row is None:
+            await message.answer("Ваучер не найден.")
+        else:
+            creator_id, remaining = row
+            if remaining <= 0:
+                await message.answer("В ваучере нет билетов.")
+            else:
+                uid = message.from_user.id
+                if uid == creator_id:
+                    await message.answer("Нельзя использовать свой ваучер.")
+                else:
+                    cur.execute("SELECT * FROM voucher_usages WHERE code = ? AND user_telegram_id = ?", (voucher_code, uid))
+                    if cur.fetchone():
+                        await message.answer("Вы уже использовали этот ваучер.")
+                    else:
+                        # Получить 1 билет
+                        cur.execute("UPDATE users SET tickets = tickets + 1 WHERE user_telegram_id = ?", (uid,))
+                        cur.execute("UPDATE vouchers SET remaining_tickets = remaining_tickets - 1 WHERE code = ?", (voucher_code,))
+                        cur.execute("INSERT INTO voucher_usages (code, user_telegram_id) VALUES (?, ?)", (voucher_code, uid))
+
+                        # Установить реферала, если не установлен
+                        cur.execute("SELECT referrer_id FROM users WHERE user_telegram_id = ?", (uid,))
+                        current_referrer = cur.fetchone()[0]
+                        if current_referrer is None:
+                            cur.execute("UPDATE users SET referrer_id = ? WHERE user_telegram_id = ?", (creator_id, uid))
+                            try:
+                                await bot.send_message(creator_id, f"У вас новый реферал через ваучер: @{user.username}")
+                            except Exception as e:
+                                print(f"Ошибка уведомления: {e}")
+
+                        conn.commit()
+
+                        await message.answer("🎟 Получен 1 билет от ваучера!")
 
     cur.execute("SELECT is_active, prizes, end_time, cost_per_ticket_aur, cost_per_ticket_ton FROM contest WHERE id = 1")
     row = cur.fetchone()
@@ -293,6 +414,9 @@ async def cmd_addchat(message: types.Message):
 
 @dp.callback_query(lambda c: c.data == "topup")
 async def cb_topup(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.username is None:
+        await callback.answer("У вас нет username. Установите его в настройках Telegram.", show_alert=True)
+        return
     if callback.message.chat.type != "private":
         await callback.answer("Только в ЛС", show_alert=True)
         return
@@ -331,12 +455,13 @@ async def process_topup_amount(message: types.Message, state: FSMContext):
     data = await state.get_data()
     currency = data.get("currency", "AUR")
 
-    if not message.text.isdigit():
+    try:
+        amount = float(message.text)
+    except ValueError:
         await message.answer("Введите число")
         return
 
-    amount = int(message.text)
-    memo = f"{message.from_user.id}_{message.from_user.username or 'no_username'}"
+    memo = f"{message.from_user.id}_{message.from_user.username}"
 
     cur.execute("SELECT cost_per_ticket_aur, cost_per_ticket_ton FROM contest WHERE id = 1")
     row = cur.fetchone()
@@ -346,25 +471,69 @@ async def process_topup_amount(message: types.Message, state: FSMContext):
 
     text = f"💳 Пополнение на {amount} {currency}\n"
     text += f"На эту сумму можно купить ~{max_tickets} билетов\n"
-    text += f"Кошелёк: <code>{TON_WALLET}</code>\n"
-    text += f"Memo: <code>{memo}</code>"
-    msg = await message.answer(text, parse_mode="HTML", reply_markup=paid_kb(message.message_id))
+    text += f"Кошелёк: {TON_WALLET}\n"
+    text += f"Memo: {memo}"
 
-    username = message.from_user.username or f"ID{message.from_user.id}"
-    await bot.send_message(
-        ADMIN_ID,
-        f"🟢 Запрос пополнения\nОт: @{username}\nВалюта: {currency}\nСумма: {amount}",
-        reply_markup=confirm_topup_kb(message.from_user.id, amount, currency)
+    # Отправляем сообщение без клавиатуры сначала
+    msg = await message.answer(text, parse_mode="HTML")
+
+    # Теперь редактируем с клавиатурой, используя msg.message_id
+    await bot.edit_message_reply_markup(
+        chat_id=message.chat.id,
+        message_id=msg.message_id,
+        reply_markup=topup_kb(msg.message_id)
     )
+
+    # Сохранить данные заявки
+    pending_topups[msg.message_id] = {
+        'user_id': message.from_user.id,
+        'amount': amount,
+        'currency': currency,
+        'memo': memo
+    }
 
     await state.clear()
 
+@dp.callback_query(lambda c: c.data.startswith("copy_wallet_"))
+async def copy_wallet(callback: types.CallbackQuery):
+    message_id = int(callback.data.split("_")[2])
+    await callback.answer("Адрес скопирован!")
+    await callback.message.answer(f"{TON_WALLET}", parse_mode="HTML")
+
+@dp.callback_query(lambda c: c.data.startswith("copy_memo_"))
+async def copy_memo(callback: types.CallbackQuery):
+    message_id = int(callback.data.split("_")[2])
+    if message_id in pending_topups:
+        memo = pending_topups[message_id]['memo']
+        await callback.answer("Memo скопировано!")
+        await callback.message.answer(f"{memo}", parse_mode="HTML")
+    else:
+        await callback.answer("Данные не найдены.")
+
 @dp.callback_query(lambda c: c.data.startswith("paid_topup_"))
 async def paid_topup(callback: types.CallbackQuery):
-    await callback.message.delete()
-    await callback.answer("Сообщение удалено.")
+    message_id = int(callback.data.split("_")[2])
+    if message_id not in pending_topups:
+        await callback.answer("Заявка не найдена.")
+        return
 
-@dp.callback_query(lambda c: c.data.startswith("confirm_"))
+    data = pending_topups[message_id]
+    user_id = data['user_id']
+    amount = data['amount']
+    currency = data['currency']
+
+    username = callback.from_user.username
+    await bot.send_message(
+        ADMIN_ID,
+        f"🟢 Запрос пополнения\nОт: @{username}\nВалюта: {currency}\nСумма: {amount}",
+        reply_markup=confirm_topup_kb(user_id, amount, currency)
+    )
+
+    del pending_topups[message_id]
+    await callback.message.delete()
+    await callback.answer("Заявка отправлена админу.")
+
+@dp.callback_query(lambda c: c.data.startswith("confirm_") and len(c.data.split("_")) == 4)
 async def confirm_topup(callback: types.CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
         await callback.answer("Запрещено", show_alert=True)
@@ -372,7 +541,8 @@ async def confirm_topup(callback: types.CallbackQuery):
 
     try:
         _, uid_str, amt_str, currency = callback.data.split("_")
-        uid, amt = int(uid_str), int(amt_str)
+        uid = int(uid_str)
+        amt = float(amt_str)
     except:
         await callback.answer("Ошибка данных", show_alert=True)
         return
@@ -387,7 +557,7 @@ async def confirm_topup(callback: types.CallbackQuery):
     if currency == "AUR":
         cur.execute(
             "UPDATE users SET aur_balance = aur_balance + ? WHERE user_telegram_id = ?",
-            (amt, uid)
+            (int(amt), uid)
         )
     else:
         cur.execute(
@@ -410,7 +580,7 @@ async def confirm_topup(callback: types.CallbackQuery):
             user_remind_tasks[uid].cancel()
         user_remind_tasks[uid] = asyncio.create_task(remind_user(uid))
 
-@dp.callback_query(lambda c: c.data.startswith("reject_"))
+@dp.callback_query(lambda c: c.data.startswith("reject_") and len(c.data.split("_")) == 4)
 async def reject_topup(callback: types.CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
         await callback.answer("Запрещено", show_alert=True)
@@ -419,7 +589,7 @@ async def reject_topup(callback: types.CallbackQuery):
     try:
         _, uid_str, amt_str, currency = callback.data.split("_")
         uid = int(uid_str)
-        amt = int(amt_str)
+        amt = float(amt_str)
     except:
         await callback.answer("Ошибка", show_alert=True)
         return
@@ -428,8 +598,231 @@ async def reject_topup(callback: types.CallbackQuery):
     await callback.message.edit_text(callback.message.text + "\n\n❌ Отклонено")
     await callback.answer()
 
+@dp.callback_query(lambda c: c.data == "withdraw")
+async def cb_withdraw(callback: types.CallbackQuery, state: FSMContext):
+    if callback.message.chat.type != "private":
+        await callback.answer("Только в ЛС", show_alert=True)
+        return
+    if await check_rate_limit_and_ban(callback.from_user.id, "withdraw"):
+        await callback.answer("Вы заблокированы за спам.", show_alert=True)
+        return
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💎 AUR", callback_data="withdraw_aur")],
+        [InlineKeyboardButton(text="🔵 TON", callback_data="withdraw_ton")],
+    ])
+    await callback.message.answer("Выберите валюту для вывода:", reply_markup=kb)
+    try:
+        await callback.message.delete()  # Удалить меню после нажатия
+    except:
+        pass  # Игнорируем ошибку удаления
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data.startswith("withdraw_"))
+async def process_withdraw_currency(callback: types.CallbackQuery, state: FSMContext):
+    currency = callback.data.split("_")[1].upper()
+    await state.update_data(currency=currency)
+    await callback.message.answer(f"Введите сумму для вывода в {currency}:")
+    await state.set_state(WithdrawState.waiting_amount)
+    try:
+        await callback.message.delete()  # Удалить сообщение с выбором
+    except:
+        pass  # Игнорируем ошибку удаления
+    await callback.answer()
+
+@dp.message(WithdrawState.waiting_amount)
+async def process_withdraw_amount(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    currency = data.get("currency", "AUR")
+
+    try:
+        amount = float(message.text)
+    except ValueError:
+        await message.answer("Введите число")
+        return
+
+    uid = message.from_user.id
+    if currency == "AUR":
+        cur.execute("SELECT aur_balance FROM users WHERE user_telegram_id = ?", (uid,))
+        balance = cur.fetchone()[0] or 0
+    else:
+        cur.execute("SELECT ton_balance FROM users WHERE user_telegram_id = ?", (uid,))
+        balance = cur.fetchone()[0] or 0.0
+
+    if amount > balance:
+        await message.answer(f"Недостаточно средств. Доступно {balance} {currency}")
+        return
+
+    await state.update_data(amount=amount)
+    await message.answer("Введите адрес для вывода:")
+    await state.set_state(WithdrawState.waiting_address)
+
+@dp.message(WithdrawState.waiting_address)
+async def process_withdraw_address(message: types.Message, state: FSMContext):
+    address = message.text
+    data = await state.get_data()
+    currency = data.get("currency", "AUR")
+    amount = data.get("amount")
+    uid = message.from_user.id
+
+    cur.execute("INSERT INTO withdraw_requests (user_id, amount, currency, address) VALUES (?, ?, ?, ?)", (uid, amount, currency, address))
+    withdraw_id = cur.lastrowid
+    conn.commit()
+
+    text = f"Заявка на вывод {amount} {currency} на адрес {address}"
+    msg = await message.answer(text, parse_mode="HTML")
+    
+    await bot.edit_message_reply_markup(
+        chat_id=message.chat.id,
+        message_id=msg.message_id,
+        reply_markup=withdraw_kb(withdraw_id)
+    )
+
+    await state.clear()
+
+@dp.callback_query(lambda c: c.data.startswith("paid_withdraw_"))
+async def paid_withdraw(callback: types.CallbackQuery):
+    try:
+        _, _, withdraw_id_str = callback.data.split("_")
+        withdraw_id = int(withdraw_id_str)
+    except:
+        await callback.answer("Ошибка данных", show_alert=True)
+        return
+
+    cur.execute("SELECT user_id, amount, currency, address FROM withdraw_requests WHERE id = ? AND status = 'pending'", (withdraw_id,))
+    row = cur.fetchone()
+    if not row:
+        await callback.answer("Заявка не найдена или уже обработана.")
+        return
+
+    user_id, amount, currency, address = row
+
+    username = callback.from_user.username
+    await bot.send_message(
+        ADMIN_ID,
+        f"🔴 Запрос вывода\nОт: @{username}\nВалюта: {currency}\nСумма: {amount}\nАдрес: {address}",
+        parse_mode="HTML",
+        reply_markup=confirm_withdraw_kb(withdraw_id, amount, currency)
+    )
+
+    await callback.message.delete()
+    await callback.answer("Заявка отправлена админу.")
+
+@dp.callback_query(lambda c: c.data.startswith("copy_address_"))
+async def copy_address(callback: types.CallbackQuery):
+    try:
+        _, _, withdraw_id_str = callback.data.split("_")
+        withdraw_id = int(withdraw_id_str)
+    except:
+        await callback.answer("Ошибка данных", show_alert=True)
+        return
+
+    cur.execute("SELECT address FROM withdraw_requests WHERE id = ? AND status = 'pending'", (withdraw_id,))
+    row = cur.fetchone()
+    if not row:
+        await callback.answer("Заявка не найдена или уже обработана.")
+        return
+
+    address = row[0]
+    await callback.answer("Адрес скопирован!")
+    await callback.message.answer(f"{address}", parse_mode="HTML")
+
+@dp.callback_query(lambda c: c.data.startswith("copy_amount_"))
+async def copy_amount(callback: types.CallbackQuery):
+    try:
+        _, _, withdraw_id_str = callback.data.split("_")
+        withdraw_id = int(withdraw_id_str)
+    except:
+        await callback.answer("Ошибка данных", show_alert=True)
+        return
+
+    cur.execute("SELECT amount FROM withdraw_requests WHERE id = ? AND status = 'pending'", (withdraw_id,))
+    row = cur.fetchone()
+    if not row:
+        await callback.answer("Заявка не найдена или уже обработана.")
+        return
+
+    amount = row[0]
+    await callback.answer("Сумма скопирована!")
+    await callback.message.answer(f"{amount}", parse_mode="HTML")
+
+@dp.callback_query(lambda c: c.data.startswith("confirm_withdraw_"))
+async def confirm_withdraw(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("Запрещено", show_alert=True)
+        return
+
+    try:
+        _, _, withdraw_id_str = callback.data.split("_")
+        withdraw_id = int(withdraw_id_str)
+    except:
+        await callback.answer("Ошибка данных", show_alert=True)
+        return
+
+    cur.execute("SELECT user_id, amount, currency FROM withdraw_requests WHERE id = ? AND status = 'pending'", (withdraw_id,))
+    row = cur.fetchone()
+    if not row:
+        await callback.answer("Заявка не найдена или уже обработана.", show_alert=True)
+        return
+
+    uid, amt, currency = row
+
+    # Проверка баланса
+    if currency == "AUR":
+        cur.execute("SELECT aur_balance FROM users WHERE user_telegram_id = ?", (uid,))
+        balance = cur.fetchone()[0] or 0
+        if balance < amt:
+            await callback.answer("Недостаточно средств у пользователя", show_alert=True)
+            return
+        cur.execute("UPDATE users SET aur_balance = aur_balance - ? WHERE user_telegram_id = ?", (amt, uid))
+    else:
+        cur.execute("SELECT ton_balance FROM users WHERE user_telegram_id = ?", (uid,))
+        balance = cur.fetchone()[0] or 0.0
+        if balance < amt:
+            await callback.answer("Недостаточно средств у пользователя", show_alert=True)
+            return
+        cur.execute("UPDATE users SET ton_balance = ton_balance - ? WHERE user_telegram_id = ?", (amt, uid))
+
+    cur.execute("UPDATE withdraw_requests SET status = 'confirmed' WHERE id = ?", (withdraw_id,))
+    conn.commit()
+
+    await bot.send_message(uid, f"✅ Вывод {amt} {currency} подтверждён")
+    await callback.message.edit_text(callback.message.text + "\n\n✅ Подтверждено")
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data.startswith("reject_withdraw_"))
+async def reject_withdraw(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("Запрещено", show_alert=True)
+        return
+
+    try:
+        _, _, withdraw_id_str = callback.data.split("_")
+        withdraw_id = int(withdraw_id_str)
+    except:
+        await callback.answer("Ошибка данных", show_alert=True)
+        return
+
+    cur.execute("SELECT user_id, amount, currency FROM withdraw_requests WHERE id = ? AND status = 'pending'", (withdraw_id,))
+    row = cur.fetchone()
+    if not row:
+        await callback.answer("Заявка не найдена или уже обработана.", show_alert=True)
+        return
+
+    uid, amt, currency = row
+
+    cur.execute("UPDATE withdraw_requests SET status = 'rejected' WHERE id = ?", (withdraw_id,))
+    conn.commit()
+
+    await bot.send_message(uid, f"❌ Вывод {amt} {currency} отклонён")
+    await callback.message.edit_text(callback.message.text + "\n\n❌ Отклонено")
+    await callback.answer()
+
 @dp.callback_query(lambda c: c.data == "buy")
 async def start_buy_tickets(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.username is None:
+        await callback.answer("У вас нет username. Установите его в настройках Telegram.", show_alert=True)
+        return
     if callback.message.chat.type != "private":
         await callback.answer("Только в ЛС", show_alert=True)
         return
@@ -544,7 +937,7 @@ async def process_buy_tickets(message: types.Message, state: FSMContext):
         cur.execute("UPDATE users SET tickets = tickets + 1 WHERE user_telegram_id = ?", (referrer_id,))
         cur.execute("UPDATE users SET rewarded_referrer = 1 WHERE user_telegram_id = ?", (uid,))
         
-        buyer_username = message.from_user.username or f"ID{uid}"
+        buyer_username = message.from_user.username
         try:
             await bot.send_message(referrer_id, f"Ваш реферал @{buyer_username} купил билет — вы получили 1 билет!")
         except Exception as e:
@@ -605,9 +998,8 @@ async def ref(callback: types.CallbackQuery):
         await callback.answer("Вы заблокированы за спам.", show_alert=True)
         return
     me = await bot.get_me()
-    await callback.message.answer(
-        f"https://t.me/{me.username}?start={callback.from_user.id}"
-    )
+    ref_link = f"https://t.me/{me.username}?start={callback.from_user.id}"
+    await callback.message.answer(f"{ref_link}", parse_mode="HTML")
     try:
         await callback.message.delete()  # Удалить меню
     except:
@@ -712,8 +1104,8 @@ async def cmd_send(message: types.Message):
     cur.execute("UPDATE users SET tickets = tickets + ? WHERE user_telegram_id = ?", (quantity, recipient_id))
     conn.commit()
 
-    sender_username = message.from_user.username or f"ID{sender_id}"
-    recipient_username = (await bot.get_chat(recipient_id)).username or f"ID{recipient_id}"
+    sender_username = message.from_user.username
+    recipient_username = (await bot.get_chat(recipient_id)).username
 
     await message.reply(f"✅ Отправлено {quantity} билет(ов) пользователю @{recipient_username}")
     try:
@@ -732,6 +1124,212 @@ async def cmd_send(message: types.Message):
         except Exception as e:
             print(f"Ошибка отправки в чат: {e}")
 
+# ──────────────────── ВАУЧЕРЫ ────────────────────
+
+@dp.callback_query(lambda c: c.data == "create_voucher")
+async def start_create_voucher(callback: types.CallbackQuery, state: FSMContext):
+    if callback.message.chat.type != "private":
+        await callback.answer("Только в ЛС", show_alert=True)
+        return
+    if await check_rate_limit_and_ban(callback.from_user.id, "create_voucher"):
+        await callback.answer("Вы заблокированы за спам.", show_alert=True)
+        return
+
+    uid = callback.from_user.id
+    cur.execute("SELECT tickets FROM users WHERE user_telegram_id = ?", (uid,))
+    row = cur.fetchone()
+    if row is None or row[0] == 0:
+        await callback.answer("У вас нет билетов для создания ваучера.", show_alert=True)
+        return
+
+    max_tickets = row[0]
+    await callback.message.answer(f"Ваш баланс билетов: {max_tickets}\nВведите количество билетов для ваучера (1-{max_tickets}):")
+    await state.set_state(CreateVoucherState.waiting_quantity)
+    try:
+        await callback.message.delete()  # Удалить меню
+    except:
+        pass
+    await callback.answer()
+
+@dp.message(CreateVoucherState.waiting_quantity)
+async def process_create_voucher(message: types.Message, state: FSMContext):
+    if not message.text.isdigit() or int(message.text) <= 0:
+        await message.answer("Введите положительное целое число")
+        return
+
+    quantity = int(message.text)
+    uid = message.from_user.id
+    cur.execute("SELECT tickets FROM users WHERE user_telegram_id = ?", (uid,))
+    tickets = cur.fetchone()[0]
+    if quantity > tickets:
+        await message.answer(f"У вас только {tickets} билетов.")
+        return
+
+    # Генерация уникального кода
+    code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
+    while True:
+        cur.execute("SELECT code FROM vouchers WHERE code = ?", (code,))
+        if cur.fetchone() is None:
+            break
+        code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
+
+    cur.execute("INSERT INTO vouchers (code, creator_telegram_id, remaining_tickets) VALUES (?, ?, ?)", (code, uid, quantity))
+    cur.execute("UPDATE users SET tickets = tickets - ? WHERE user_telegram_id = ?", (quantity, uid))
+    conn.commit()
+
+    me = await bot.get_me()
+    voucher_link = f"https://t.me/{me.username}?start={code}"
+    caption = f"🎫 Ваучер создан! Код: {code}\nБилетов: {quantity}"
+    image_url = "https://i.etsystatic.com/16434705/r/il/213e5f/5174919950/il_fullxfull.5174919950_4eo3.jpg"
+
+    await bot.send_photo(
+        chat_id=message.chat.id,
+        photo=image_url,
+        caption=caption,
+        parse_mode="HTML",
+        reply_markup=voucher_kb(voucher_link)
+    )
+
+    await state.clear()
+
+@dp.message(Command("redeem"))
+async def cmd_redeem(message: types.Message):
+    if await check_rate_limit_and_ban(message.from_user.id, "redeem"):
+        await message.answer("Вы заблокированы за спам.")
+        return
+
+    args = message.text.split()
+    if len(args) != 2:
+        await message.answer("Формат: /redeem <код>")
+        return
+
+    code = args[1]
+    cur.execute("SELECT creator_telegram_id, remaining_tickets FROM vouchers WHERE code = ?", (code,))
+    row = cur.fetchone()
+    if row is None:
+        await message.answer("Ваучер не найден.")
+        return
+    creator_id, remaining = row
+    if remaining <= 0:
+        await message.answer("В ваучере нет билетов.")
+        return
+
+    uid = message.from_user.id
+    if uid == creator_id:
+        await message.answer("Нельзя использовать свой ваучер.")
+        return
+
+    cur.execute("SELECT * FROM voucher_usages WHERE code = ? AND user_telegram_id = ?", (code, uid))
+    if cur.fetchone():
+        await message.answer("Вы уже использовали этот ваучер.")
+        return
+
+    # Получить 1 билет
+    cur.execute("UPDATE users SET tickets = tickets + 1 WHERE user_telegram_id = ?", (uid,))
+    cur.execute("UPDATE vouchers SET remaining_tickets = remaining_tickets - 1 WHERE code = ?", (code,))
+    cur.execute("INSERT INTO voucher_usages (code, user_telegram_id) VALUES (?, ?)", (code, uid))
+
+    # Установить реферала, если не установлен
+    cur.execute("SELECT referrer_id FROM users WHERE user_telegram_id = ?", (uid,))
+    referrer = cur.fetchone()[0]
+    if referrer is None:
+        cur.execute("UPDATE users SET referrer_id = ? WHERE user_telegram_id = ?", (creator_id, uid))
+        try:
+            await bot.send_message(creator_id, f"У вас новый реферал через ваучер: @{message.from_user.username}")
+        except Exception as e:
+            print(f"Ошибка уведомления: {e}")
+
+    conn.commit()
+
+    await message.answer("🎟 Получен 1 билет от ваучера!")
+
+# ──────────────────── СЖИГАНИЕ AUR ДЛЯ ТАЙМЕРА ────────────────────
+
+@dp.callback_query(lambda c: c.data == "burn_aur")
+async def start_burn_aur(callback: types.CallbackQuery, state: FSMContext):
+    if callback.message.chat.type != "private":
+        await callback.answer("Только в ЛС", show_alert=True)
+        return
+    if await check_rate_limit_and_ban(callback.from_user.id, "burn_aur"):
+        await callback.answer("Вы заблокированы за спам.", show_alert=True)
+        return
+
+    cur.execute("SELECT is_active FROM contest WHERE id = 1")
+    is_active = cur.fetchone()[0]
+    if not is_active:
+        await callback.answer("Нет активного конкурса.", show_alert=True)
+        return
+
+    uid = callback.from_user.id
+    cur.execute("SELECT aur_balance FROM users WHERE user_telegram_id = ?", (uid,))
+    row = cur.fetchone()
+    if row is None or row[0] == 0:
+        await callback.answer("У вас нет AUR для сжигания.", show_alert=True)
+        return
+
+    balance = row[0]
+    max_minutes = balance // BURN_AUR_PER_MINUTE
+    text = f"Ваш баланс AUR: {balance}\nСжигание {BURN_AUR_PER_MINUTE} AUR сокращает таймер на 1 минуту и раздаёт {BONUS_TICKETS_PER_BURN} билет(а) случайным участникам.\nВведите количество минут для сокращения (1-{max_minutes}):"
+    await callback.message.answer(text)
+    await state.set_state(BurnAurState.waiting_amount)
+    try:
+        await callback.message.delete()  # Удалить меню
+    except:
+        pass
+    await callback.answer()
+
+@dp.message(BurnAurState.waiting_amount)
+async def process_burn_aur(message: types.Message, state: FSMContext):
+    if not message.text.isdigit() or int(message.text) <= 0:
+        await message.answer("Введите положительное целое число")
+        return
+
+    minutes = int(message.text)
+    uid = message.from_user.id
+    cur.execute("SELECT aur_balance FROM users WHERE user_telegram_id = ?", (uid,))
+    balance = cur.fetchone()[0]
+    cost = minutes * BURN_AUR_PER_MINUTE
+    if cost > balance:
+        await message.answer(f"Недостаточно AUR. Требуется {cost}, доступно {balance}.")
+        return
+
+    # Сократить таймер
+    cur.execute("SELECT end_time FROM contest WHERE id = 1")
+    end_time_str = cur.fetchone()[0]
+    end_time = datetime.fromisoformat(end_time_str)
+    new_end_time = end_time - timedelta(minutes=minutes)
+    if new_end_time <= datetime.now(timezone.utc):
+        await message.answer("Нельзя сократить таймер до прошлого времени.")
+        return
+    cur.execute("UPDATE contest SET end_time = ? WHERE id = 1", (new_end_time.isoformat(),))
+
+    # Сжечь AUR
+    cur.execute("UPDATE users SET aur_balance = aur_balance - ? WHERE user_telegram_id = ?", (cost, uid))
+
+    # Раздать билеты случайным участникам
+    cur.execute("SELECT user_telegram_id FROM users WHERE tickets > 0 AND user_telegram_id != ?", (uid,))
+    participants = [row[0] for row in cur.fetchall()]
+    if participants:
+        bonus_tickets = minutes * BONUS_TICKETS_PER_BURN
+        for _ in range(bonus_tickets):
+            recipient_id = random.choice(participants)
+            cur.execute("UPDATE users SET tickets = tickets + 1 WHERE user_telegram_id = ?", (recipient_id,))
+            try:
+                await bot.send_message(recipient_id, "🎟 Вы получили 1 бонусный билет от сжигания таймера!")
+            except:
+                pass
+
+    conn.commit()
+
+    if announce_chat_id:
+        try:
+            await bot.send_message(announce_chat_id, f"🔥 Таймер сокращён на {minutes} минут! Раздано {minutes * BONUS_TICKETS_PER_BURN} билет(ов) участникам.")
+        except Exception as e:
+            print(f"Ошибка отправки в чат: {e}")
+
+    await message.answer(f"✅ Сожжено {cost} AUR, таймер сокращён на {minutes} минут, раздано {minutes * BONUS_TICKETS_PER_BURN} билет(ов).")
+    await state.clear()
+
 # ──────────────────── АДМИН ФУНКЦИИ ────────────────────
 
 @dp.callback_query(lambda c: c.data == "admin_start")
@@ -747,10 +1345,10 @@ async def admin_start(callback: types.CallbackQuery):
         await callback.answer()
         return
 
-    # Сброс всех балансов и билетов перед запуском конкурса
-    cur.execute("UPDATE users SET tickets = 0, aur_balance = 0, ton_balance = 0.0, rewarded_referrer = 0 WHERE user_telegram_id != ?", (ADMIN_ID,))
+    # Сброс только билетов и rewarded_referrer перед запуском конкурса
+    cur.execute("UPDATE users SET tickets = 0, rewarded_referrer = 0 WHERE user_telegram_id != ?", (ADMIN_ID,))
     conn.commit()
-    await callback.message.answer("Все балансы и билеты сброшены перед запуском конкурса.")
+    await callback.message.answer("Билеты сброшены перед запуском конкурса.")
 
     cur.execute("SELECT prizes, duration_minutes FROM contest WHERE id = 1")
     row = cur.fetchone()
@@ -909,12 +1507,12 @@ async def admin_view_balances(callback: types.CallbackQuery):
         await callback.answer("Нет доступа", show_alert=True)
         return
 
-    cur.execute("SELECT user_telegram_id, username, aur_balance, ton_balance, tickets FROM users")
+    cur.execute("SELECT username, aur_balance, ton_balance, tickets FROM users WHERE username IS NOT NULL")
     rows = cur.fetchall()
     if not rows:
         await callback.message.answer("Нет игроков")
     else:
-        text = "Балансы:\n" + "\n".join([f"@{r[1] or f'ID{r[0]}'}: {r[2]} AUR, {r[3]} TON, {r[4]} билетов" for r in rows])
+        text = "Балансы:\n" + "\n".join([f"@{r[0]}: {r[1]} AUR, {r[2]} TON, {r[3]} билетов" for r in rows])
         await callback.message.answer(text)
     await callback.answer()
 
@@ -935,7 +1533,7 @@ async def admin_restore_list(callback: types.CallbackQuery, state: FSMContext):
         await callback.answer("Нет доступа", show_alert=True)
         return
 
-    await callback.message.answer("Введите список участников в формате:\n@username: X AUR, Y TON, Z билетов\nИли @IDXXXX: ... для пользователей без username.\nОдин на строку.")
+    await callback.message.answer("Введите список участников в формате:\n@username: X AUR, Y TON, Z билетов\nОдин на строку.")
     await state.set_state(RestoreListState.waiting_list)
     await callback.answer()
 
@@ -955,58 +1553,25 @@ async def process_restore_list(message: types.Message, state: FSMContext):
             skipped.append(line)
             continue
 
-        username_part = match.group(1)
+        username = match.group(1)
         aur = int(match.group(2))
         ton = float(match.group(3))
         tickets = int(match.group(4))
 
-        user_telegram_id = None
-        username = None
-
-        if username_part.startswith("ID"):
-            try:
-                user_telegram_id = int(username_part[2:])
-            except ValueError:
-                skipped.append(line)
-                continue
-        else:
-            username = username_part
-
-        # Try to get user_telegram_id if not provided
-        if user_telegram_id is None and username is not None:
-            try:
-                chat = await bot.get_chat(f'@{username}')
-                user_telegram_id = chat.id
-            except Exception as e:
-                print(f"Ошибка получения user_telegram_id для {username}: {e}")
-
         # Find existing record
-        existing_id = None
-        if user_telegram_id is not None:
-            cur.execute("SELECT id FROM users WHERE user_telegram_id = ?", (user_telegram_id,))
-            row = cur.fetchone()
-            if row:
-                existing_id = row[0]
-        if existing_id is None and username is not None:
-            cur.execute("SELECT id FROM users WHERE username = ?", (username,))
-            row = cur.fetchone()
-            if row:
-                existing_id = row[0]
-
-        if existing_id is not None:
-            # Update existing
+        cur.execute("SELECT id FROM users WHERE username = ?", (username,))
+        row = cur.fetchone()
+        if row:
+            existing_id = row[0]
             cur.execute("""
-                UPDATE users SET aur_balance = ?, ton_balance = ?, tickets = ?,
-                user_telegram_id = COALESCE(?, user_telegram_id),
-                username = COALESCE(?, username)
+                UPDATE users SET aur_balance = ?, ton_balance = ?, tickets = ?
                 WHERE id = ?
-            """, (aur, ton, tickets, user_telegram_id, username, existing_id))
+            """, (aur, ton, tickets, existing_id))
         else:
-            # Insert new
             cur.execute("""
-                INSERT INTO users (user_telegram_id, username, aur_balance, ton_balance, tickets)
-                VALUES (?, ?, ?, ?, ?)
-            """, (user_telegram_id, username, aur, ton, tickets))
+                INSERT INTO users (username, aur_balance, ton_balance, tickets)
+                VALUES (?, ?, ?, ?)
+            """, (username, aur, ton, tickets))
 
         updated_count += 1
 
@@ -1110,19 +1675,36 @@ async def perform_draw(total_tickets):
         for internal_id, count in participants:
             pool.extend([internal_id] * count)
 
-        winners_ids = set()
-        while len(winners_ids) < min(num_prizes, len(set(pool))):
-            winner_internal_id = random.choice(pool)
-            winners_ids.add(winner_internal_id)
+        winners_list = []
+        if num_prizes > 0 and participants:
+            # Find user with max tickets for first prize
+            max_tickets = max(p[1] for p in participants)
+            max_users = [p[0] for p in participants if p[1] == max_tickets]
+            first_winner_id = random.choice(max_users) if len(max_users) > 1 else max_users[0]
+            winners_list.append(first_winner_id)
+
+            # Remove first winner's entries from pool
+            pool = [uid for uid in pool if uid != first_winner_id]
+
+            # Select remaining winners randomly
+            unique_remaining = len(set(pool))
+            num_remaining_prizes = min(num_prizes - 1, unique_remaining)
+            remaining_winners = set()
+            while len(remaining_winners) < num_remaining_prizes:
+                if not pool:
+                    break
+                winner_id = random.choice(pool)
+                remaining_winners.add(winner_id)
+            winners_list.extend(list(remaining_winners))
 
         winners = []
-        for wid in winners_ids:
+        for wid in winners_list:
             cur.execute("SELECT username, user_telegram_id FROM users WHERE id = ?", (wid,))
             row = cur.fetchone()
             if row:
                 winners.append(row)
 
-    winners_text = ", ".join([f"@{w[0] or f'ID{w[1]}'}" for w in winners]) if winners else "Нет победителей"
+    winners_text = ", ".join([f"@{w[0]}" for w in winners]) if winners else "Нет победителей"
     text = f"🎉 Конкурс завершён!\nПобедители: {winners_text}\nПоздравляем!"
 
     await bot.edit_message_text(
@@ -1137,7 +1719,7 @@ async def perform_draw(total_tickets):
             winner = winners[i]
             winner_username, winner_telegram_id = winner
             winner_tickets, winner_prob = await get_winner_stats(winner_username, winner_telegram_id, total_tickets)
-            edit_text = f"{i+1}й приз: {prizes[i]} победил @{winner_username or f'ID{winner_telegram_id}'} ({winner_tickets} билетов, {winner_prob:.2f}%)"
+            edit_text = f"{i+1}й приз: {prizes[i]} победил @{winner_username} ({winner_tickets} билетов, {winner_prob:.2f}%)"
             await bot.edit_message_text(edit_text, chat_id=announce_chat_id, message_id=mid)
             if winner_telegram_id:
                 await bot.send_message(winner_telegram_id, f"🎉 Вы выиграли {prizes[i]}! Напишите админу.")
@@ -1147,9 +1729,9 @@ async def perform_draw(total_tickets):
     await send_admin_log()
 
     cur.execute("UPDATE contest SET is_active = 0, end_time = NULL WHERE id = 1")
-    cur.execute("UPDATE users SET tickets = 0, aur_balance = 0, ton_balance = 0.0, rewarded_referrer = 0 WHERE user_telegram_id != ?", (ADMIN_ID,))
+    cur.execute("UPDATE users SET tickets = 0 WHERE user_telegram_id != ?", (ADMIN_ID,))
     conn.commit()
-    print("Розыгрыш завершён, билеты и балансы сброшены для пользователей")
+    print("Розыгрыш завершён, билеты сброшены для пользователей")
 
     # Cancel all reminders
     for task in user_remind_tasks.values():
@@ -1161,11 +1743,6 @@ async def get_winner_stats(username, telegram_id, total_tickets):
     tickets = 0
     if username:
         cur.execute("SELECT tickets FROM users WHERE username = ?", (username,))
-        row = cur.fetchone()
-        if row:
-            tickets = row[0] or 0
-    if tickets == 0 and telegram_id:
-        cur.execute("SELECT tickets FROM users WHERE user_telegram_id = ?", (telegram_id,))
         row = cur.fetchone()
         if row:
             tickets = row[0] or 0
