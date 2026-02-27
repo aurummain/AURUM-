@@ -17,7 +17,7 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 # ──────────────────── НАСТРОЙКИ ────────────────────
 
-BOT_TOKEN = "8505295400:AAF6xOuPHUihIdlrkWorG_ndXcnn53Ps3O8"
+BOT_TOKEN = "8274963448:AAE06C6g-0A7aWoPMI51zos3IIsevhxDwSE"
 ADMIN_ID = 1333099097
 TON_WALLET = "UQBJNtgVfE-x7-K1uY_EhW1rdvGKhq5gM244fX89VF0bof7R"
 
